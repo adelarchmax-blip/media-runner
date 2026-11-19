@@ -69,7 +69,8 @@ async function mdmList() {
   return a.downloads;
 }
 
-// The app's settings before each start: the automation API on, no first-run windows, and
+// The app's settings before each start: the automation API on, no first-run windows, the most
+// connections, and
 // downloads into this item's outDir (each item has its own folder, removed after its upload, so
 // the folder is set again for every item while the rest of the app's data is kept).
 function prepareData() {
@@ -87,6 +88,9 @@ function prepareData() {
     extension_never_ask: true,
     show_start_dialog: false,
     automation_api: true,
+    // Options → Connection → "Default max. conn. number": the pieces of a stream (HLS, DASH) and
+    // the parts of a file MDM downloads at once. 32 is the most MDM allows without unlocking more.
+    max_connections: 32,
     category_dirs: ["General", "Compressed", "Documents", "Music", "Programs", "Video"].map((c) => [c, path.resolve(outDir)]),
     torrent_handler: false,
   };
