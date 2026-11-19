@@ -146,13 +146,19 @@ async function buttonState(page) {
   return null;
 }
 
-// The biggest visible video in any frame, its centre in the page's viewport.
+// Ad networks' players and clips (any site): their videos are never the item.
+const AD = /doubleclick|2mdn\.net|googlesyndication|imasdk|googleads|adservice|adnxs|springserve|spotx|teads|\/ads?\//i;
+
+// The biggest visible video in any frame (not an ad's), its centre in the page's viewport.
 async function videoBox(page) {
   let best = null;
   for (const frame of page.frames()) {
+    if (AD.test(frame.url())) continue;
     const r = await frame
-      .evaluate(() => {
+      .evaluate((ad) => {
+        const AD = new RegExp(ad, "i");
         const vs = [...document.querySelectorAll("video")]
+          .filter((e) => !AD.test(e.currentSrc || e.src || ""))
           .map((e) => [e, e.getBoundingClientRect()])
           .filter(([, r]) => r.width >= 200 && r.height >= 112)
           .sort((a, b) => b[1].width * b[1].height - a[1].width * a[1].height);
@@ -161,7 +167,7 @@ async function videoBox(page) {
         v.muted = true;
         v.play().catch(() => {});
         return { x: r.left + r.width / 2, y: r.top + r.height / 2, area: r.width * r.height };
-      })
+      }, AD.source)
       .catch(() => null);
     if (!r || (best && best.area >= r.area)) continue;
     const o = await frameOffset(frame);
@@ -225,7 +231,8 @@ async function main() {
 
     browser = await puppeteer.launch({
       executablePath: CHROME,
-      headless: true,
+      // A real window on xvfb's screen: some players don't load in headless Chrome.
+      headless: false,
       pipe: true,
       userDataDir: profile,
       env,
