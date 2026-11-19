@@ -397,10 +397,12 @@ def work_details(title: str, year: int = None) -> dict:
                 pages = _json("https://ar.wikipedia.org/w/api.php", action="query", format="json", titles=claims["_arwiki"],
                               prop="extracts", exintro=1, explaintext=1).get("query", {}).get("pages", {})
                 summary = next((p.get("extract") for p in pages.values() if p.get("extract")), summary)
+            # Only people with a picture are shown; a name with an empty frame adds nothing.
+            with_photo = lambda people: [p for p in people if p.get("photo")]
             return {
                 "summary": _short(summary),
-                "director": _people(claims, "P57", 3),
-                "cast": _people(claims, "P161", 10) or _lead_people(lang, page.get("title", ""), 10),
+                "director": with_photo(_people(claims, "P57", 3)),
+                "cast": with_photo(_people(claims, "P161", 10)) or with_photo(_lead_people(lang, page.get("title", ""), 10)),
                 "link": f"https://{lang}.wikipedia.org/wiki/{requests.utils.quote(page.get('title', '').replace(' ', '_'))}",
             }
     return {"summary": "", "director": [], "cast": [], "link": ""}
@@ -452,8 +454,16 @@ def _web_posters(title: str, year: int = None) -> list:
     arabic = re.search(r"[\u0600-\u06FF]", title)
     queries = [f"{title} {year or ''} poster".strip(), f"{'بوستر فيلم' if arabic else 'movie poster'} {title} {year or ''}".strip()]
     scored = {}
+    engines = "google images,bing images,duckduckgo images,qwant images"
     for q in queries:
-        for r in _json(f"{base}/search", q=q, categories="images", format="json", safesearch=1).get("results", []):
+        answer = _json(f"{base}/search", q=q, categories="images", engines=engines, format="json", safesearch=1)
+        per_engine = {}
+        for r in answer.get("results", []):
+            for e in r.get("engines") or [r.get("engine")]:
+                per_engine[e] = per_engine.get(e, 0) + 1
+        silent = [u[0] if isinstance(u, list) else u for u in answer.get("unresponsive_engines", [])]
+        logging.info(f"picture search: {per_engine or 'no results'}" + (f", not answering: {silent}" if silent else ""))
+        for r in answer.get("results", []):
             src, label = r.get("img_src") or "", _norm(f"{r.get('title', '')} {r.get('content', '')}")
             if not src.startswith("http") or not all(w in label.split() for w in want):
                 continue

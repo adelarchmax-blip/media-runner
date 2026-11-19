@@ -12,3 +12,14 @@ search:
   formats:
     - html
     - json
+# Picture engines asked for every poster search (the fastest ones first). Each search logs how many
+# results each engine gave and which ones did not answer, without the work's name.
+engines:
+  - name: google images
+    disabled: false
+  - name: bing images
+    disabled: false
+  - name: duckduckgo images
+    disabled: false
+  - name: qwant images
+    disabled: false
