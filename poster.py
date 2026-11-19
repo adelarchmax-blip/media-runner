@@ -5,10 +5,12 @@ import requests
 from PIL import Image, ImageFilter, ImageEnhance
 
 
-JELLYFIN_RATIO_W = 1000
-JELLYFIN_RATIO_H = 1500
+# 800x1200 تكفي لأكبر بطاقة في Jellyfin وتجعل الملف خفيفاً (~100-200KB) فيقل عمل Jellyfin على أوراكل
+JELLYFIN_RATIO_W = 800
+JELLYFIN_RATIO_H = 1200
 MAX_POSTER_SIZE_BYTES = 1024 * 1024  # 1 ميجابايت أقصى حد
-TARGET_OPTIMAL_SIZE_BYTES = 350 * 1024  # الحجم المثالي المستهدف
+TARGET_OPTIMAL_SIZE_BYTES = 200 * 1024
+MIN_SOURCE_WIDTH = 300  # الحجم المثالي المستهدف
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -62,11 +64,11 @@ def compress_and_save_poster(img: Image.Image, output_path: str, max_bytes: int 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     
     # محاولة الحفظ بجودة متدرجة
-    for quality in [90, 84, 78, 72, 65, 55]:
+    for quality in [85, 80, 75, 70, 65, 55]:
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
         size = buf.tell()
-        if size <= max_bytes:
+        if size <= TARGET_OPTIMAL_SIZE_BYTES or (quality == 55 and size <= max_bytes):
             with open(output_path, "wb") as f:
                 f.write(buf.getvalue())
             logging.debug("poster saved")
@@ -134,7 +136,78 @@ def fetch_imdb_poster(title: str, year: int = None) -> str:
         logging.debug("imdb lookup failed")
     return ""
 
+def _download_image(url: str):
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=12)
+        if resp.status_code == 200 and resp.headers.get("Content-Type", "").startswith("image"):
+            img = Image.open(io.BytesIO(resp.content))
+            img.load()
+            return img if img.size[0] >= MIN_SOURCE_WIDTH else None
+    except Exception:
+        return None
+    return None
+
+
+def _query_variants(title: str) -> list:
+    """صيغ بحث متعددة: الاسم كاملاً، الجزء اللاتيني فقط، الجزء العربي فقط"""
+    variants = [title]
+    latin = " ".join(re.findall(r"[A-Za-z0-9][A-Za-z0-9'&:.-]*", title)).strip()
+    arabic = " ".join(re.findall(r"[\u0600-\u06FF0-9]+", title)).strip()
+    for v in (latin, arabic):
+        if v and len(v) > 2 and v not in variants:
+            variants.append(v)
+    return variants
+
+
+def _wikipedia_image(query: str) -> str:
+    """صورة العمل من ويكيبيديا (عربي ثم إنجليزي) كمصدر بديل مجاني بلا مفاتيح"""
+    for lang in ("ar", "en"):
+        try:
+            r = requests.get(f"https://{lang}.wikipedia.org/w/api.php", headers=HEADERS, timeout=8, params={
+                "action": "query", "format": "json", "generator": "search", "gsrsearch": query, "gsrlimit": 1,
+                "prop": "pageimages", "piprop": "original"})
+            pages = (r.json().get("query") or {}).get("pages") or {}
+            for p in pages.values():
+                src = (p.get("original") or {}).get("source")
+                if src:
+                    return src
+        except Exception:
+            continue
+    return ""
+
+
+def find_best_poster(source: str, title: str, year: int = None):
+    """ترتيب المصادر: صورة الموقع (إن كانت بدقة كافية) ← IMDb بعدة صيغ ← ويكيبيديا ← None"""
+    if source and source.startswith("http"):
+        img = _download_image(imdb_high_res(source))
+        if img:
+            return img
+    for q in _query_variants(title or ""):
+        url = fetch_imdb_poster(q, year)
+        if url:
+            img = _download_image(url)
+            if img:
+                return img
+    for q in _query_variants(title or ""):
+        url = _wikipedia_image(f"{q} {year}" if year else q)
+        if url:
+            img = _download_image(url)
+            if img:
+                return img
+    return None
+
+
 def process_poster(source: str, output_path: str, title: str = "", year: int = None) -> bool:
+    """بوستر Jellyfin: أفضل صورة متاحة، مطبّعة لـ 2:3 كاملة بلا قص أو مط، خفيفة الحجم"""
+    try:
+        img = find_best_poster(source, title, year) or create_fallback_poster(title)
+        return compress_and_save_poster(normalize_poster_dimensions(img), output_path)
+    except Exception as e:
+        logging.error(f"poster processing failed ({type(e).__name__})")
+        return False
+
+
+def _legacy_process_poster(source: str, output_path: str, title: str = "", year: int = None) -> bool:
     """
     معالجة شاملة للبوستر من رابط ويب أو مسار محلي أو البحث عنه في IMDb وحفظه كـ poster.jpg مطابق لجيلي فين بنسبة 2:3 وحجم < 1 ميجابايت.
     """
