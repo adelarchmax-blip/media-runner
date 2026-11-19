@@ -24,7 +24,8 @@ MEDIA_BASE = os.environ["MEDIA_BASE_PATH"].strip("/")
 RUN_ID = os.environ.get("RUN_ID", "local")
 WORK_DIR = os.path.abspath("work")
 
-START = time.time()
+START = float(os.environ.get("RUN_STARTED") or 0) or time.time()
+STAGE = {"now": "working"}         # what the dashboard shows this run is doing
 MAX_SECONDS = 350 * 60
 STOP_MARGIN = 25 * 60          # لا نبدأ مادة جديدة إذا تبقى أقل من 25 دقيقة
 REPORT_INTERVAL = 10           # ثوانٍ بين تقارير التقدم
@@ -49,12 +50,19 @@ def api(path: str, payload: dict) -> dict:
 
 def report(item_id: int, status: str, **extra):
     api("miinspact-report", {"item_id": item_id, "status": status, "run_id": RUN_ID,
-                             "run_started_at": START, **extra})
+                             "run_started_at": START, "stage": STAGE["now"], **extra})
+
+
+def set_stage(stage: str):
+    """Moves the dashboard's stage line at once (item stages travel with the item's reports)."""
+    STAGE["now"] = stage
+    api("miinspact-report", {"heartbeat_only": True, "run_id": RUN_ID, "run_started_at": START, "stage": stage})
 
 
 def heartbeat_loop(stop: threading.Event):
     while not stop.wait(60):
-        api("miinspact-report", {"heartbeat_only": True, "run_id": RUN_ID, "run_started_at": START})
+        api("miinspact-report", {"heartbeat_only": True, "run_id": RUN_ID, "run_started_at": START,
+                                 "stage": STAGE["now"]})
 
 
 def safe_name(name: str) -> str:
@@ -209,6 +217,7 @@ def process(item: dict):
     progress = Progress(item_id)
     try:
         folder, base_name, poster_folder = destination(item)
+        STAGE["now"] = "item_details"
         progress.push(force=True)
         # The poster and the work's details first, so the dashboard shows what is downloading.
         local_poster = os.path.join(job_dir, "poster.jpg")
@@ -219,7 +228,10 @@ def process(item: dict):
             progress.push(force=True, details=details)
         except Exception as e:
             logging.warning(f"item {item_id}: no details ({type(e).__name__})")
+        STAGE["now"] = "item_download"
+        progress.push(force=True)
         video = download(item, os.path.join(job_dir, base_name), progress)
+        STAGE["now"] = "item_verify"
         verify_video(video)
         progress.dl_pct = 100
         progress.size_mb = os.path.getsize(video) / 1048576
@@ -231,6 +243,8 @@ def process(item: dict):
             subprocess.run(["rclone", "copyto", local_poster, f"{REMOTE}:{poster_remote}"],
                            check=True, capture_output=True)
 
+        STAGE["now"] = "item_upload"
+        progress.push(force=True)
         ext = os.path.splitext(video)[1]
         remote_video = f"{folder}/{base_name}{ext}"
         speed = upload(video, remote_video, progress)
@@ -247,7 +261,7 @@ def process(item: dict):
 def main():
     stop = threading.Event()
     threading.Thread(target=heartbeat_loop, args=(stop,), daemon=True).start()
-    api("miinspact-report", {"heartbeat_only": True, "run_id": RUN_ID, "run_started_at": START})
+    set_stage("working")
     done = 0
     try:
         while time.time() - START < MAX_SECONDS - STOP_MARGIN:
@@ -261,6 +275,7 @@ def main():
                 done += 1
     finally:
         stop.set()
+        set_stage("done")
     logging.info(f"processed {done} item(s) in {(time.time() - START) / 60:.1f} min")
 
 

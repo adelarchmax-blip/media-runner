@@ -14,8 +14,15 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    env:
+      RUNNER_API_URL: ${{ secrets.RUNNER_API_URL }}
+      RUNNER_API_TOKEN: ${{ secrets.RUNNER_API_TOKEN }}
+      RUN_ID: ${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Report start
+        run: echo "RUN_STARTED=$(date +%s)" >> "$GITHUB_ENV" && RUN_STARTED=$(date +%s) sh stage.sh booting
 
       - uses: actions/setup-python@v5
         with:
@@ -24,6 +31,7 @@ jobs:
 
       - name: Install tools
         run: |
+          sh stage.sh installing
           # Only what the runner image lacks; apt's index is refreshed only when needed.
           need=""; for c in ffmpeg rclone xvfb xdotool; do b=$c; [ $c = xvfb ] && b=Xvfb; command -v $b >/dev/null || need="$need $c"; done
           if [ -n "$need" ]; then
@@ -38,6 +46,7 @@ jobs:
 
       - name: Install Mister Download Manager
         run: |
+          sh stage.sh downloader
           bash mdm/setup.sh
           cd mdm && npm ci --no-audit --no-fund --silent
 
@@ -51,6 +60,7 @@ jobs:
         # when a work has no picture on its site, its encyclopedia article or IMDb.
         continue-on-error: true
         run: |
+          sh stage.sh search
           docker run -d --name searxng -p 127.0.0.1:8888:8080 \
             -e SEARXNG_SECRET="$(openssl rand -hex 32)" \
             -v "$GITHUB_WORKSPACE/search/settings.yml:/etc/searxng/settings.yml:ro" \
@@ -59,9 +69,6 @@ jobs:
       - name: Process jobs
         env:
           SEARX_URL: http://127.0.0.1:8888
-          RUNNER_API_URL: ${{ secrets.RUNNER_API_URL }}
-          RUNNER_API_TOKEN: ${{ secrets.RUNNER_API_TOKEN }}
           RCLONE_REMOTE: ${{ secrets.RCLONE_REMOTE }}
           MEDIA_BASE_PATH: ${{ secrets.MEDIA_BASE_PATH }}
-          RUN_ID: ${{ github.run_id }}
         run: python worker.py
