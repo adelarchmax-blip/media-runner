@@ -27,7 +27,9 @@ MAX_SECONDS = 350 * 60
 STOP_MARGIN = 25 * 60          # لا نبدأ مادة جديدة إذا تبقى أقل من 25 دقيقة
 REPORT_INTERVAL = 10           # ثوانٍ بين تقارير التقدم
 BATCH_SIZE = 3
-MIN_VIDEO_BYTES = 5 * 1024 * 1024
+MIN_VIDEO_BYTES = int(float(os.environ.get("MIN_VIDEO_MB", "0.5")) * 1048576)
+MIN_SECONDS = float(os.environ.get("MIN_SECONDS", "5"))
+MDM_GRAB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mdm", "grab.mjs")
 
 
 def api(path: str, payload: dict) -> dict:
@@ -90,39 +92,33 @@ class Progress:
             report(self.item_id, "downloading", dl_pct=self.dl_pct, speed_mbs=round(self.speed, 2),
                    size_mb=round(self.size_mb, 1), **extra)
 
-    def ytdlp_hook(self, d: dict):
-        if d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            if total:
-                self.dl_pct = int(d.get("downloaded_bytes", 0) * 100 / total)
-                self.size_mb = total / 1048576
-            self.speed = (d.get("speed") or 0) / 1048576
-            self.push()
-
 
 def download(item: dict, out_base: str, progress: Progress) -> str:
-    import yt_dlp
-    opts = {
-        "outtmpl": out_base + ".%(ext)s",
-        "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "retries": 5,
-        "fragment_retries": 10,
-        "concurrent_fragment_downloads": 4,
-        "progress_hooks": [progress.ytdlp_hook],
-        "logger": logging.getLogger("ytdlp-silent"),
-    }
-    logging.getLogger("ytdlp-silent").setLevel(logging.CRITICAL)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([item["watch_url"]])
-    for f in os.listdir(os.path.dirname(out_base)):
-        path = os.path.join(os.path.dirname(out_base), f)
-        if f.startswith(os.path.basename(out_base)) and not f.endswith((".part", ".ytdl", ".jpg")):
-            return path
-    raise RuntimeError("no output file")
+    """التحميل عبر إضافة Mister Download Manager الرسمية داخل كروم، والبرنامج نفسه ينزّل الملف"""
+    out_dir = os.path.dirname(out_base) + "/mdm"
+    os.makedirs(out_dir, exist_ok=True)
+    proc = subprocess.Popen(["xvfb-run", "-a", "node", MDM_GRAB, item["watch_url"], out_dir],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    result = {}
+    for line in proc.stdout:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if "progress" in msg:
+            progress.dl_pct = max(0, msg["progress"])
+            progress.speed = (msg.get("speed") or 0) / 1048576
+            progress.push()
+        else:
+            result = msg
+    proc.wait()
+    if not result.get("ok"):
+        raise RuntimeError(f"MDM: {result.get('error', 'no result')}")
+    src = result["path"]
+    progress.size_mb = os.path.getsize(src) / 1048576
+    dst = out_base + os.path.splitext(src)[1]
+    shutil.move(src, dst)
+    return dst
 
 
 def verify_video(path: str):
@@ -130,8 +126,8 @@ def verify_video(path: str):
         raise RuntimeError("file too small")
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
                          capture_output=True, text=True, timeout=60)
-    if float(out.stdout.strip() or 0) < 60:
-        raise RuntimeError("duration < 60s")
+    if float(out.stdout.strip() or 0) < MIN_SECONDS:
+        raise RuntimeError("duration too short")
 
 
 def remote_exists(remote_path: str) -> bool:

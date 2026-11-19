@@ -90,6 +90,8 @@ function prepareData() {
 // The native messaging host for Chrome: registered by MDM's own helper, then copied into the
 // browser profile (with --user-data-dir, Chrome reads host manifests from there).
 function registerHost(profile) {
+  // MDM registers for the browsers whose config folder exists (a fresh runner has none yet).
+  fs.mkdirSync(path.join(os.homedir(), ".config", "google-chrome"), { recursive: true });
   const reg = spawnSync("misterdownloadmanager-nmhost", ["--register"], { encoding: "utf8" });
   if (reg.status !== 0) throw new Error(`nmhost --register: ${reg.stderr || reg.stdout}`);
   const written = [...(reg.stdout || "").matchAll(/^registered \S+ in (.+)$/gm)].map((m) => path.join(m[1].trim(), `${HOST}.json`));

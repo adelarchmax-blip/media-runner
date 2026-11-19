@@ -25,6 +25,7 @@ jobs:
           node-version: "22"
       - name: Install tools
         run: |
+          sudo rm -f /var/lib/man-db/auto-update
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends ffmpeg xvfb > /dev/null
       - name: Install Mister Download Manager
@@ -38,5 +39,5 @@ jobs:
           PAGE_URL: ${{ inputs.url }}
         run: |
           xvfb-run -a node grab.mjs "$PAGE_URL" "$RUNNER_TEMP/out" | tee "$RUNNER_TEMP/grab.log"
-          F=$(tail -1 "$RUNNER_TEMP/grab.log" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])')
+          F=$(tail -1 "$RUNNER_TEMP/grab.log" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("path") or sys.exit(d.get("error")))')
           ffprobe -v error -show_entries format=duration,size:stream=codec_name,width,height -of compact "$F"
