@@ -24,9 +24,12 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo rm -f /var/lib/man-db/auto-update
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends ffmpeg rclone xvfb > /dev/null
+          # Only what the runner image lacks; apt's index is refreshed only when needed.
+          need=""; for c in ffmpeg rclone xvfb; do b=$c; [ $c = xvfb ] && b=Xvfb; command -v $b >/dev/null || need="$need $c"; done
+          if [ -n "$need" ]; then
+            sudo rm -f /var/lib/man-db/auto-update
+            sudo apt-get install -y -qq --no-install-recommends $need > /dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $need > /dev/null; }
+          fi
           pip install -q -r requirements.txt
 
       - uses: actions/setup-node@v4

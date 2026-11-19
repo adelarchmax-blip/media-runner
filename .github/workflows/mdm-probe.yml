@@ -25,9 +25,18 @@ jobs:
           node-version: "22"
       - name: Install tools
         run: |
-          sudo rm -f /var/lib/man-db/auto-update
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends ffmpeg xvfb > /dev/null
+          # Only what the runner image lacks; apt's index is refreshed only when needed.
+          need=""; for c in ffmpeg xvfb; do b=$c; [ $c = xvfb ] && b=Xvfb; command -v $b >/dev/null || need="$need $c"; done
+          if [ -n "$need" ]; then
+            sudo rm -f /var/lib/man-db/auto-update
+            sudo apt-get install -y -qq --no-install-recommends $need > /dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $need > /dev/null; }
+          fi
+      - name: Network speed
+        run: |
+          down=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 30 'https://speed.cloudflare.com/__down?bytes=200000000')
+          head -c 50000000 /dev/zero > /tmp/up.bin
+          up=$(curl -s -o /dev/null -w '%{speed_upload}' --max-time 30 -X POST --data-binary @/tmp/up.bin 'https://speed.cloudflare.com/__up')
+          python3 -c "import sys; d,u=map(float,sys.argv[1:]); print(f'SPEED download {d*8/1e6:.0f} Mbps ({d/1048576:.1f} MB/s) | upload {u*8/1e6:.0f} Mbps ({u/1048576:.1f} MB/s)')" "$down" "$up"
       - name: Install Mister Download Manager
         run: bash mdm/setup.sh
       - name: Install browser driver
