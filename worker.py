@@ -62,6 +62,21 @@ def safe_name(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip()[:150] or "Unknown"
 
 
+_SECTION_PATH = re.compile(r"^[A-Za-z_]+(?:/[A-Za-z_]+)?$")
+
+
+def library_folder(item: dict, default: str) -> str:
+    """The library folder the controller chose for this item (its main library and, inside it, the
+    owner's sub-section). Anything malformed falls back to the default library."""
+    section = item.get("section_path") or ""
+    if not _SECTION_PATH.match(section):
+        section = default
+    category = safe_name(item.get("category")) if item.get("category") else ""
+    if category and category.strip(".") and not category.startswith("."):
+        return f"{section}/{category}"
+    return section
+
+
 def destination(item: dict) -> tuple:
     """(مجلد الفيديو، اسم الملف، مجلد البوستر) بنفس تسمية مكتبات Jellyfin"""
     title = safe_name(item.get("clean_title"))
@@ -71,12 +86,14 @@ def destination(item: dict) -> tuple:
     if ctype == "series":
         season = int(item.get("season") or 1)
         episode = int(item.get("episode") or 1)
-        root = f"{MEDIA_BASE}/Series/{'Arabic_Series' if arabic else 'Foreign_Series'}/{title}"
+        lib = library_folder({**item, "category": None}, f"Series/{'Arabic_Series' if arabic else 'Foreign_Series'}")
+        root = f"{MEDIA_BASE}/{lib}/{title}"
         return f"{root}/Season {season:02d}", f"{title} - S{season:02d}E{episode:02d}", root
     if ctype == "play":
-        folder = f"{MEDIA_BASE}/Plays/{title}{year}"
+        folder = f"{MEDIA_BASE}/{library_folder(item, 'Plays')}/{title}{year}"
         return folder, f"{title}{year}", folder
-    folder = f"{MEDIA_BASE}/Movies/{'Arabic_Movies' if arabic else 'Foreign_Movies'}/{title}{year}"
+    lib = library_folder(item, f"Movies/{'Arabic_Movies' if arabic else 'Foreign_Movies'}")
+    folder = f"{MEDIA_BASE}/{lib}/{title}{year}"
     return folder, f"{title}{year}", folder
 
 
