@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Video page to download through Mister Download Manager"
+        description: "Video page(s) to download through Mister Download Manager, one after another (space-separated), the way the worker does"
         required: true
 
 concurrency:
@@ -45,24 +45,39 @@ jobs:
       - name: Download through the extension
         working-directory: mdm
         env:
-          PAGE_URL: ${{ inputs.url }}
-          MDM_SHOTS: ${{ runner.temp }}
+          PAGE_URLS: ${{ inputs.url }}
         run: |
-          xvfb-run -a -s "-screen 0 2400x1000x24" node grab.mjs "$PAGE_URL" "$RUNNER_TEMP/out" | tee "$RUNNER_TEMP/grab.log"
-          F=$(tail -1 "$RUNNER_TEMP/grab.log" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("path") or sys.exit(d.get("error")))')
-          ffprobe -v error -show_entries format=duration,size:stream=codec_name,width,height -of compact "$F"
+          # Each page in its own folder and screenshot folder, the folder removed after it (as the
+          # worker does); MDM's processes listed between pages.
+          set -f  # page addresses are split on spaces only, never expanded as file patterns
+          n=0; fail=0
+          for u in $PAGE_URLS; do
+            n=$((n+1)); export MDM_SHOTS="$RUNNER_TEMP/shots/$n"; mkdir -p "$MDM_SHOTS"
+            echo "::group::page $n"
+            xvfb-run -a -s "-screen 0 2400x1000x24" node grab.mjs "$u" "$RUNNER_TEMP/out/$n" 2> "$MDM_SHOTS/grab.log" | tail -1 | tee "$MDM_SHOTS/result.json"
+            cat "$MDM_SHOTS/grab.log"
+            F=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("path",""))' "$MDM_SHOTS/result.json")
+            if [ -n "$F" ]; then ffprobe -v error -show_entries format=duration,size -of compact "$F"; else fail=1; fi
+            echo "::endgroup::"
+            echo "--- MDM processes left after page $n:"; pgrep -af -i misterdownload || echo "(none)"
+            rm -rf "$RUNNER_TEMP/out/$n"
+          done
+          exit $fail
+
       - name: Diagnostics
         if: always()
+        env:
+          PAGE_URLS: ${{ inputs.url }}
         run: |
           D="$HOME/mdm/data"
           echo "extension-seen: $(cat "$D/extension-seen" 2>/dev/null)"
           grep -v "usvg\|zbus\|XSETTINGS\|portal" "$D/logs/mdm.log" 2>/dev/null | tail -n 60 | cut -c1-400 || true
           echo "--- video-info"
-          MDM_DATA_DIR="$D" timeout 120 misterdownloadmanager-cli video-info "${{ inputs.url }}" 2>&1 | cut -c1-600 | head -20 || true
+          MDM_DATA_DIR="$D" timeout 120 misterdownloadmanager-cli video-info "${PAGE_URLS%% *}" 2>&1 | cut -c1-600 | head -20 || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: probe-shots
-          path: ${{ runner.temp }}/*.png
+          path: ${{ runner.temp }}/shots
           retention-days: 3
           if-no-files-found: ignore
