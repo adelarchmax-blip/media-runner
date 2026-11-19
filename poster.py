@@ -166,7 +166,7 @@ def ask_ai(task: dict):
     if not url or not token:
         return None
     try:
-        r = requests.post(f"{url}/miinspact-ai-match", json=task, headers={"X-Runner-Token": token}, timeout=90)
+        r = requests.post(f"{url}/miinspact-ai-match", json=task, headers={"X-Runner-Token": token}, timeout=300)
         return r.json() if r.status_code == 200 and r.content else None
     except (requests.RequestException, ValueError):
         return None
