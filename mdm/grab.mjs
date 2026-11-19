@@ -133,6 +133,93 @@ async function buttonState(page) {
   return null;
 }
 
+// DevTools' copy of a frame's DOM, closed shadow trees included, with a few readers.
+async function domTree(frame) {
+  const { root } = await frame.client.send("DOM.getDocument", { depth: -1, pierce: true });
+  return root;
+}
+function findNode(n, test) {
+  if (test(n)) return n;
+  for (const k of [...(n.children || []), ...(n.shadowRoots || []), ...(n.contentDocument ? [n.contentDocument] : [])]) {
+    const f = findNode(k, test);
+    if (f) return f;
+  }
+  return null;
+}
+function findAll(n, test, out = []) {
+  if (test(n)) out.push(n);
+  for (const k of [...(n.children || []), ...(n.shadowRoots || [])]) findAll(k, test, out);
+  return out;
+}
+function attrOf(n, name) {
+  const a = n.attributes || [];
+  for (let i = 0; i < a.length; i += 2) if (a[i] === name) return a[i + 1];
+  return null;
+}
+const classed = (c) => (n) => n.nodeType === 1 && (attrOf(n, "class") || "").split(/\s+/).includes(c);
+const textOf = (n) => (n.nodeType === 3 ? n.nodeValue : (n.children || []).map(textOf).join(""));
+async function centreOf(frame, node) {
+  const { model } = await frame.client.send("DOM.getBoxModel", { nodeId: node.nodeId });
+  const q = model.border;
+  const o = await frameOffset(frame);
+  return { x: (q[0] + q[4]) / 2 + o.x, y: (q[1] + q[5]) / 2 + o.y, w: model.width, h: model.height };
+}
+async function buttonFrame(page) {
+  for (const frame of page.frames()) {
+    const host = (await frame.$("mdm-video-button").catch(() => null)) || (await frame.$("pierce/mdm-video-button").catch(() => null));
+    if (host) return frame;
+  }
+  return null;
+}
+
+// The button's menu (its arrow): opened, its look-up waited for, then "Download best" (its first
+// line), which downloads with no question. Returns true once that line was clicked.
+async function downloadBestFromMenu(page) {
+  const frame = await buttonFrame(page);
+  if (!frame) return false;
+  const shadowOf = (root) => {
+    const host = findNode(root, (n) => n.localName === "mdm-video-button" && n.shadowRoots && n.shadowRoots.length);
+    return host && host.shadowRoots[0];
+  };
+  let shadow = shadowOf(await domTree(frame));
+  const more = shadow && findNode(shadow, classed("more"));
+  if (!more) return false;
+  const at = await centreOf(frame, more);
+  await page.mouse.move(at.x, at.y);
+  await sleep(300);
+  await page.mouse.click(at.x, at.y);
+  log("opened the button's menu");
+  const best = await until(
+    "the menu's qualities",
+    LOOKUP_MS,
+    async () => {
+      // Keep the pointer on the menu so it stays open.
+      shadow = shadowOf(await domTree(frame));
+      const menu = shadow && findNode(shadow, (n) => classed("menu")(n) && classed("open")(n));
+      if (!menu) {
+        await page.mouse.move(at.x, at.y);
+        return null;
+      }
+      const rows = findNode(menu, classed("rows"));
+      if (!rows || findNode(rows, classed("skrow"))) return null;
+      const lines = findAll(rows, (n) => n.localName === "button");
+      if (!lines.length) {
+        const note = findNode(menu, classed("note"));
+        throw Object.assign(new Error(`no qualities: ${note ? textOf(note).trim() : "?"}`), { fatal: true });
+      }
+      log(`menu: ${lines.slice(0, 4).map((l) => textOf(l).replace(/\s+/g, " ").trim()).join(" | ")}`);
+      return lines.find(classed("top")) || lines[0];
+    },
+    800,
+  );
+  const p = await centreOf(frame, best);
+  await page.mouse.move(p.x, p.y);
+  await sleep(200);
+  await page.mouse.click(p.x, p.y);
+  log("clicked Download best");
+  return true;
+}
+
 // The button's closed shadow tree, read from DevTools' copy of the frame's DOM (attributes and
 // text only, no script inside it): its state, words and where its main part is.
 async function readButton(frame) {
@@ -314,36 +401,28 @@ async function main() {
     // clicked once it names the best quality ("ready"); when the page hides it from us, it is
     // clicked where it shows (its left part, "Download video") after the look-up's time. Done once
     // MDM's own list has the download; clicked again every 20 s, at most 4 times.
-    let firstSeen = 0;
-    let lastTry = 0;
-    let clicks = 0;
-    const item = await until(
-      "the extension's button and MDM taking the video",
+    await until(
+      "the extension's button over the video",
       LOOKUP_MS,
       async () => {
         await page.mouse.move(v.x + (Date.now() % 3), v.y);
-        const s = await buttonState(page);
-        const box = s ? null : await hostBox(page);
-        const seen = s ? `${s.state} "${s.label}" "${s.chip}"` : box ? "shown (state hidden)" : "no button";
+        const st = await buttonState(page);
+        const seen = st ? `${st.state} "${st.label}" "${st.chip}"` : (await hostBox(page)) ? "shown" : "no button";
         if (seen !== lastSeen) log(`button: ${(lastSeen = seen)}`);
-        if (s && ["err", "drm", "off"].includes(s.state)) throw Object.assign(new Error(`button: ${s.state} ${s.label}`), { fatal: true });
-        const at = s
-          ? s.state === "ready" && s.chip && s.w ? { x: s.x, y: s.y } : null
-          : box ? { x: box.x + Math.min(box.width * 0.35, 70), y: box.y + box.height / 2 } : null;
-        if (at && !firstSeen) firstSeen = Date.now();
-        if (at && (s || Date.now() - firstSeen > 8000) && Date.now() - lastTry > 20_000 && clicks < 4) {
-          lastTry = Date.now();
-          clicks += 1;
-          await page.mouse.move(at.x, at.y);
-          await sleep(200);
-          await page.mouse.click(at.x, at.y);
-          log(`clicked the extension's button (${clicks})`);
-          if (clicks === 1 && process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "clicked.png") }).catch(() => {});
-        }
-        return (await mdmList()).find((d) => !before.has(d.id)) || null;
+        if (st && ["err", "drm", "off"].includes(st.state)) throw Object.assign(new Error(`button: ${st.state} ${st.label}`), { fatal: true });
+        return seen !== "no button";
       },
       700,
     );
+    let item = null;
+    for (let attempt = 1; attempt <= 3 && !item; attempt += 1) {
+      await page.mouse.move(v.x + attempt, v.y);
+      await sleep(500);
+      if (!(await downloadBestFromMenu(page).catch((e) => (e.fatal ? Promise.reject(e) : log(`menu: ${e.message}`))))) continue;
+      if (process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "clicked.png") }).catch(() => {});
+      item = await until("the download in MDM's list", 30_000, async () => (await mdmList()).find((d) => !before.has(d.id))).catch(() => null);
+    }
+    if (!item) throw new Error("MDM did not take the video");
     log(`MDM took it (#${item.id})`);
     let last = "";
     const done = await until(
