@@ -396,9 +396,27 @@ async function robotsClosed(page, href) {
 
 // General rule for any site: a player that shows no <video> yet waits for a click on play.
 // In every frame, the biggest visible play control (by its label, title, class or words);
-// else the centre of the biggest player-like iframe. Returns where it clicked, in the page.
-async function startPlayback(page) {
+// else the centre of the biggest player-like iframe. With `centre`, the centre of the page's
+// player itself (video or iframe): players draw their big play button there, and a named control
+// elsewhere (a bar, an overlay) is not always the one that starts the video. Returns where it
+// clicked, in the page.
+async function startPlayback(page, centre = false) {
   await centerPlayer(page);
+  if (centre) {
+    const r = await page
+      .evaluate(() => {
+        const els = [...document.querySelectorAll("video, iframe")]
+          .map((e) => e.getBoundingClientRect())
+          .filter((r) => r.width >= 300 && r.height >= 150 && r.top >= 0 && r.bottom <= innerHeight)
+          .sort((a, b) => b.width * b.height - a.width * a.height);
+        return els.length ? { x: els[0].left + els[0].width / 2, y: els[0].top + els[0].height / 2, frame: true } : null;
+      })
+      .catch(() => null);
+    if (r) {
+      await page.mouse.click(r.x, r.y);
+      return r;
+    }
+  }
   let best = null;
   for (const frame of page.frames()) {
     const r = await frame
@@ -506,6 +524,7 @@ async function main() {
     }
     const startUrl = page.url();
     let tried = 0;
+    let clicksHere = 0;
     const servers = await serverLinks(page);
     if (servers.length) log(`${servers.length} servers listed in the page's code`);
     let server = 0;
@@ -514,6 +533,13 @@ async function main() {
       "the page's video",
       90_000 + 30_000 * Math.min(servers.length, 3),
       async () => {
+        // A click on the player can open an ad in place of the page: back to the watch page.
+        if (page.url() !== startUrl && !page.url().startsWith(startUrl)) {
+          log("a click took the page away: back to the watch page");
+          await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+          if (server) await useServer(page, servers[server]);
+          return null;
+        }
         const box = await videoBox(page);
         if (box) return box;
         // No video 30 s after a server came up: the player frame gets the next listed server.
@@ -526,7 +552,8 @@ async function main() {
         }
         if (Date.now() - tried > 6000) {
           tried = Date.now();
-          const at = await startPlayback(page);
+          // Turns: the named play control, then the player's centre.
+          const at = await startPlayback(page, clicksHere++ % 2 === 1);
           if (at) log(`clicked play at ${Math.round(at.x)},${Math.round(at.y)}${at.frame ? " (player frame)" : ""}`);
         }
         return null;
