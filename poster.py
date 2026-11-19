@@ -144,6 +144,48 @@ def _norm(text: str) -> str:
     return " ".join(text.split())
 
 
+def _title_score(want: str, got: str) -> float:
+    """The share of words two titles have in common (1 = the same title). Only a measure: a title
+    that is not exactly the same is accepted only when the AI judge says it is the same work."""
+    a, b = set(_norm(want).split()), set(_norm(got).split())
+    if not a or not b:
+        return 0.0
+    return 1.0 if a == b else len(a & b) / max(len(a), len(b))
+
+
+# A creative work's Wikidata entry names its director, cast or screenwriter; a person's does not.
+_WORK_PROPS = ("P57", "P161", "P58", "P162")
+NEAR = 0.5            # titles this close (or closer) go to the AI judge
+
+
+def ask_ai(task: dict):
+    """The AI judge, reached like the job queue: through the controller's n8n gateway with the
+    runner's token. Returns its JSON answer, or None when it can't be asked (then nothing that is
+    not an exact match is accepted). Nothing about the work goes into the public log."""
+    url, token = os.environ.get("RUNNER_API_URL", "").rstrip("/"), os.environ.get("RUNNER_API_TOKEN", "")
+    if not url or not token:
+        return None
+    try:
+        r = requests.post(f"{url}/miinspact-ai-match", json=task, headers={"X-Runner-Token": token}, timeout=90)
+        return r.json() if r.status_code == 200 and r.content else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def ai_same_work(title: str, year, candidates: list):
+    """Index of the candidate the AI judge says is the same work as `title`, or None. Candidates are
+    dicts with title, year and a short "about" text."""
+    if not candidates:
+        return None
+    answer = ask_ai({"task": "same_work", "title": title, "year": year,
+                     "candidates": [{"id": i, **c} for i, c in enumerate(candidates)]})
+    pick = answer.get("match") if isinstance(answer, dict) else None
+    ok = isinstance(pick, int) and not isinstance(pick, bool) and 0 <= pick < len(candidates)
+    logging.info(f"AI judge: {'candidate ' + str(pick) if ok else 'no match' if answer else 'not reachable'}"
+                 f" of {len(candidates)}")
+    return pick if ok else None
+
+
 def _years_match(found, year) -> bool:
     try:
         return not year or not found or abs(int(found) - int(year)) <= 1
@@ -194,36 +236,68 @@ def _page_image(url: str) -> str:
         return ""
 
 
+def _article(lang: str, page_title: str):
+    """(page, Wikidata claims) of one encyclopedia article."""
+    pages = _json(f"https://{lang}.wikipedia.org/w/api.php", action="query", format="json", titles=page_title,
+                  prop="pageprops|pageimages|extlinks|extracts", ppprop="wikibase_item", piprop="original",
+                  ellimit=50, exintro=1, explaintext=1).get("query", {}).get("pages", {})
+    for page in pages.values():
+        qid = (page.get("pageprops") or {}).get("wikibase_item")
+        entity = _json(f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json").get("entities", {}).get(qid, {}) if qid else {}
+        claims = dict(entity.get("claims") or {})
+        arwiki = ((entity.get("sitelinks") or {}).get("arwiki") or {}).get("title")
+        if arwiki:
+            claims["_arwiki"] = arwiki
+        return page, claims
+    return None, {}
+
+
+def _article_year(claims: dict):
+    dates = [v.get("time", "")[1:5] for v in _values(claims, "P577") if isinstance(v, dict)]
+    return next((int(d) for d in dates if d.isdigit()), None)
+
+
 @functools.lru_cache(maxsize=64)
 def _articles(title: str, year: int = None) -> tuple:
     """The work's own encyclopedia article(s), Arabic Wikipedia first, then English, as
-    (language, page, Wikidata claims). Only an article whose title is the work's title counts,
-    and its Wikidata entry, when it has a date, must have the work's year (±1)."""
-    want = _norm(title)
-    found = []
-    if not want:
+    (language, page, Wikidata claims). Every candidate is measured: it must be a creative work
+    (director, cast...) and, when both have a year, the same year (±1). The same title is taken at
+    once; close titles (another spelling, a missing word) go to the AI judge, which picks the one
+    that is the same work or none."""
+    if not _norm(title):
         return ()
+    exact, near = [], []
     for lang in ("ar", "en"):
         hits = _json(f"https://{lang}.wikipedia.org/w/api.php", action="query", format="json", list="search",
-                     srsearch=f"{title} {year}" if year else title, srlimit=5).get("query", {}).get("search", [])
+                     srsearch=f"{title} {year}" if year else title, srlimit=8).get("query", {}).get("search", [])
         for hit in hits:
-            if _norm(hit.get("title")) != want:
+            score = _title_score(title, hit.get("title"))
+            if score < NEAR:
                 continue
-            pages = _json(f"https://{lang}.wikipedia.org/w/api.php", action="query", format="json", titles=hit["title"],
-                          prop="pageprops|pageimages|extlinks|extracts", ppprop="wikibase_item", piprop="original",
-                          ellimit=50, exintro=1, explaintext=1).get("query", {}).get("pages", {})
-            for page in pages.values():
-                qid = (page.get("pageprops") or {}).get("wikibase_item")
-                entity = _json(f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json").get("entities", {}).get(qid, {}) if qid else {}
-                claims = dict(entity.get("claims") or {})
-                arwiki = ((entity.get("sitelinks") or {}).get("arwiki") or {}).get("title")
-                if arwiki:
-                    claims["_arwiki"] = arwiki
-                dates = [v.get("time", "")[1:5] for v in _values(claims, "P577") if isinstance(v, dict)]
-                if year and dates and not any(_years_match(d, year) for d in dates):
-                    continue
-                found.append((lang, page, claims))
-    return tuple(found)
+            page, claims = _article(lang, hit["title"])
+            if not page or not any(claims.get(p) for p in _WORK_PROPS):
+                continue
+            found_year = _article_year(claims)
+            if year and found_year and not _years_match(found_year, year):
+                continue
+            (exact if score == 1 else near).append((score, lang, page, claims, found_year))
+    if exact:
+        return tuple(f[1:4] for f in exact)
+    near.sort(key=lambda f: -f[0])
+    near = near[:5]
+    pick = ai_same_work(title, year, [{"title": f[2].get("title", ""), "year": f[4],
+                                       "about": _short(f[2].get("extract", ""), 300)} for f in near])
+    return (near[pick][1:4],) if pick is not None else ()
+
+
+def canonical_title(title: str, year: int = None) -> str:
+    """The work's title as its encyclopedia article spells it (without "(فلم)"), or the title as given."""
+    for q in _query_variants(title or ""):
+        for _lang, page, _claims in _articles(q, year):
+            name = re.sub(r"\s*\([^)]*\)\s*$", "", page.get("title") or "").strip()
+            if name:
+                return name
+    return title
 
 
 def _values(claims: dict, prop: str) -> list:
@@ -271,6 +345,35 @@ def _people(claims: dict, prop: str, limit: int) -> list:
     return people
 
 
+_STARRING = re.compile(r"(?:\|\s*(?:بطولة|starring)\s*=|\b(?:بطولة|starring)\b)(.*?)(?:\n\s*\||\.\s|<ref|$)", re.S | re.I)
+_LINK = re.compile(r"\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]")
+
+
+def _lead_people(lang: str, page_title: str, limit: int) -> list:
+    """The cast as the article's opening names it (its infobox "starring" field, or the words after
+    "بطولة"/"starring"), with each actor's article picture. Used when Wikidata lists no cast."""
+    text = (_json(f"https://{lang}.wikipedia.org/w/api.php", action="parse", format="json", page=page_title,
+                  prop="wikitext", section=0).get("parse", {}).get("wikitext", {}) or {}).get("*", "")
+    m = _STARRING.search(text or "")
+    if not m:
+        return []
+    links, seen = [], set()
+    for target, label in _LINK.findall(m.group(1)):
+        target = target.strip()
+        if target and target not in seen and not re.match(r"^\d+$|^(?:ملف|File|تصنيف|Category):", target, re.I):
+            seen.add(target)
+            links.append((target, (label or target).strip()))
+    links = links[:limit]
+    if not links:
+        return []
+    pages = _json(f"https://{lang}.wikipedia.org/w/api.php", action="query", format="json", redirects=1,
+                  titles="|".join(t for t, _ in links), prop="pageimages", piprop="thumbnail",
+                  pithumbsize=200).get("query", {})
+    redirect = {r["from"]: r["to"] for r in pages.get("redirects", []) + pages.get("normalized", [])}
+    photo = {p.get("title"): (p.get("thumbnail") or {}).get("source", "") for p in (pages.get("pages") or {}).values()}
+    return [{"name": label, "photo": photo.get(redirect.get(t, t), "")} for t, label in links]
+
+
 def _short(text: str, limit: int = 700) -> str:
     text = " ".join((text or "").split())
     if len(text) <= limit:
@@ -297,7 +400,7 @@ def work_details(title: str, year: int = None) -> dict:
             return {
                 "summary": _short(summary),
                 "director": _people(claims, "P57", 3),
-                "cast": _people(claims, "P161", 10),
+                "cast": _people(claims, "P161", 10) or _lead_people(lang, page.get("title", ""), 10),
                 "link": f"https://{lang}.wikipedia.org/wiki/{requests.utils.quote(page.get('title', '').replace(' ', '_'))}",
             }
     return {"summary": "", "director": [], "cast": [], "link": ""}
@@ -388,11 +491,17 @@ def find_best_poster(source: str, title: str, year: int = None):
             img = _download_image(url, portrait=True)
             if img:
                 return img
-    for url in _web_posters(title or "", year):
-        if url not in seen:
-            img = _download_image(url, portrait=True)
-            if img:
-                return img
+    names = [title or ""]
+    official = canonical_title(title or "", year)
+    if _norm(official) != _norm(names[0]):
+        names.insert(0, official)
+    for name in names:
+        for url in _web_posters(name, year):
+            if url not in seen:
+                seen.add(url)
+                img = _download_image(url, portrait=True)
+                if img:
+                    return img
     return None
 
 
