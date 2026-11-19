@@ -21,5 +21,10 @@ unzip -q -o "$EXT" -d "$HOME_DIR/extension"
 MANIFEST=$(find "$HOME_DIR/extension" -name manifest.json -print -quit)
 echo "MDM_EXTENSION=$(dirname "$MANIFEST")" >> "${GITHUB_ENV:-/dev/null}"
 
-MDM_DATA_DIR="$HOME_DIR/data" misterdownloadmanager-cli install-ytdlp
+# GitHub's API limits shared runner addresses: a few tries, further apart each time.
+for i in 1 2 3 4 5; do
+  MDM_DATA_DIR="$HOME_DIR/data" misterdownloadmanager-cli install-ytdlp && break
+  [ "$i" = 5 ] && exit 1
+  sleep $((i * 20))
+done
 echo "MDM $VER ready"
