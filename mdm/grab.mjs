@@ -117,14 +117,28 @@ async function frameOffset(frame) {
 
 // The extension's button lives in a closed shadow root: DevTools reaches it, page scripts can't.
 // Searched in every frame; coordinates come back in the page's viewport.
+let lastErr = "";
 async function buttonState(page) {
   for (const frame of page.frames()) {
-    const host = await frame.$("mdm-video-button").catch(() => null);
+    // In the document, or inside a player's own (open) shadow DOM.
+    const host = (await frame.$("mdm-video-button").catch(() => null)) || (await frame.$("pierce/mdm-video-button").catch(() => null));
     if (!host) continue;
+    try {
+      return await readButton(frame, host);
+    } catch (e) {
+      const m = String(e.message || e).slice(0, 200);
+      if (m !== lastErr) log(`button read: ${(lastErr = m)}`);
+    }
+  }
+  return null;
+}
+
+async function readButton(frame, host) {
+  {
     const cdp = frame.client;
     const { node } = await cdp.send("DOM.describeNode", { objectId: host.remoteObject().objectId, pierce: true, depth: 1 });
     const root = node.shadowRoots && node.shadowRoots[0];
-    if (!root) continue;
+    if (!root) throw new Error("no shadow root");
     const { object } = await cdp.send("DOM.resolveNode", { backendNodeId: root.backendNodeId });
     const { result } = await cdp.send("Runtime.callFunctionOn", {
       objectId: object.objectId,
@@ -139,11 +153,10 @@ async function buttonState(page) {
       }`,
     });
     const v = result.value;
-    if (!v) continue;
+    if (!v) throw new Error("no pill in the button");
     const o = await frameOffset(frame);
     return { ...v, x: v.x + o.x, y: v.y + o.y };
   }
-  return null;
 }
 
 // Ad networks' players and clips (any site): their videos are never the item.
