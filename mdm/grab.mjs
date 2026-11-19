@@ -157,7 +157,8 @@ function confirmVideoWindow() {
   spawnSync("xdotool", ["windowfocus", "--sync", w.id], { timeout: 5000 });
   if (process.env.MDM_SHOTS && !shotWindow) {
     shotWindow = true;
-    spawnSync("import", ["-window", w.id, path.join(process.env.MDM_SHOTS, "mdm-window.png")], { timeout: 10000 });
+    spawnSync("sleep", ["2"]);
+    spawnSync("ffmpeg", ["-loglevel", "error", "-y", "-f", "x11grab", "-video_size", "2400x1000", "-i", process.env.DISPLAY, "-frames:v", "1", path.join(process.env.MDM_SHOTS, "screen.png")], { timeout: 15000 });
   }
   spawnSync("xdotool", ["key", "--clearmodifiers", "Return"], { timeout: 5000 });
   log(`pressed Enter in "${w.name}"`);
