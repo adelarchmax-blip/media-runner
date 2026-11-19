@@ -95,7 +95,8 @@ function registerHost(profile) {
   const reg = spawnSync("misterdownloadmanager-nmhost", ["--register"], { encoding: "utf8" });
   if (reg.status !== 0) throw new Error(`nmhost --register: ${reg.stderr || reg.stdout}`);
   const written = [...(reg.stdout || "").matchAll(/^registered \S+ in (.+)$/gm)].map((m) => path.join(m[1].trim(), `${HOST}.json`));
-  const manifest = written.find((w) => !/mozilla/i.test(w) && fs.existsSync(w));
+  // The .deb registers it for everyone (/etc/opt/chrome); --register then writes nothing.
+  const manifest = [...written, `/etc/opt/chrome/native-messaging-hosts/${HOST}.json`].find((w) => !/mozilla/i.test(w) && fs.existsSync(w));
   if (!manifest) throw new Error(`no Chromium host manifest: ${reg.stdout}`);
   fs.mkdirSync(path.join(profile, "NativeMessagingHosts"), { recursive: true });
   fs.copyFileSync(manifest, path.join(profile, "NativeMessagingHosts", `${HOST}.json`));
