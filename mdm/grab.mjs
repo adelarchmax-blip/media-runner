@@ -147,7 +147,8 @@ function confirmVideoWindow() {
   const wins = mdmWindows();
   const names = wins.map((w) => w.name).join(" | ");
   if (names !== windowsSeen) log(`MDM windows: ${(windowsSeen = names) || "none"}`);
-  const w = wins.find((x) => /video|download/i.test(x.name) && !/^mister download manager$/i.test(x.name));
+  // Any window of MDM's other than its main one ("Mister Download Manager <version>").
+  const w = wins.find((x) => !/^Mister Download Manager( [\d.]+)?$/i.test(x.name));
   if (!w) return false;
   spawnSync("xdotool", ["windowfocus", "--sync", w.id], { timeout: 5000 });
   spawnSync("xdotool", ["key", "--window", w.id, "--clearmodifiers", "Return"], { timeout: 5000 });
@@ -458,9 +459,10 @@ async function main() {
           const vb = (await videoBox(page)) || v;
           await page.mouse.move(vb.x + (Date.now() % 3), vb.y);
           await sleep(400);
+          // Where it shows on the screen: its main part is its left side ("Download video").
           const st = await buttonState(page);
-          const box = st ? null : await hostBox(page);
-          const at = st ? { x: st.x, y: st.y } : box ? { x: box.x + Math.min(box.width * 0.35, 70), y: box.y + box.height / 2 } : null;
+          const box = await hostBox(page);
+          const at = box ? { x: box.x + Math.min(box.width * 0.35, 70), y: box.y + box.height / 2 } : null;
           if (at) {
             lastTry = Date.now();
             clicks += 1;
