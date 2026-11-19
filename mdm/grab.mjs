@@ -170,6 +170,46 @@ async function videoBox(page) {
   return best;
 }
 
+// General rule for any site: a player that shows no <video> yet waits for a click on play.
+// In every frame, the biggest visible play control (by its label, title, class or words);
+// else the centre of the biggest player-like iframe. Returns where it clicked, in the page.
+async function startPlayback(page) {
+  let best = null;
+  for (const frame of page.frames()) {
+    const r = await frame
+      .evaluate(() => {
+        const words = /\b(play|watch|start)\b|تشغيل|مشاهدة|شاهد|إبدأ|ابدأ/i;
+        const seen = (e) => {
+          const r = e.getBoundingClientRect();
+          const st = getComputedStyle(e);
+          return r.width >= 16 && r.height >= 16 && st.visibility !== "hidden" && st.display !== "none" && r.bottom > 0 && r.top < innerHeight ? r : null;
+        };
+        let pick = null;
+        for (const e of document.querySelectorAll("button, [role=button], a, div, span, svg")) {
+          const label = [e.getAttribute("aria-label"), e.getAttribute("title"), e.getAttribute("data-testid"), typeof e.className === "string" ? e.className : "", e.children.length ? "" : e.textContent].join(" ");
+          if (!words.test(label) || /pause|إيقاف|playlist|player-?settings/i.test(label)) continue;
+          const r = seen(e);
+          if (r && (!pick || r.width * r.height > pick.a)) pick = { x: r.left + r.width / 2, y: r.top + r.height / 2, a: r.width * r.height };
+        }
+        if (pick) return pick;
+        for (const f of document.querySelectorAll("iframe")) {
+          const r = seen(f);
+          if (r && r.width >= 300 && r.height >= 150 && (!pick || r.width * r.height > pick.a)) pick = { x: r.left + r.width / 2, y: r.top + r.height / 2, a: r.width * r.height, frame: true };
+        }
+        return pick;
+      })
+      .catch(() => null);
+    if (!r) continue;
+    const o = await frameOffset(frame);
+    const c = { x: r.x + o.x, y: r.y + o.y, a: r.a, frame: r.frame };
+    // A real control beats an iframe's centre; then the bigger.
+    if (!best || (best.frame && !c.frame) || (!!best.frame === !!c.frame && c.a > best.a)) best = c;
+  }
+  if (!best) return null;
+  await page.mouse.click(best.x, best.y);
+  return best;
+}
+
 async function main() {
   prepareData();
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "mdm-chrome-"));
@@ -203,7 +243,22 @@ async function main() {
     const before = new Set((await mdmList()).map((d) => d.id));
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    const v = await until("the page's video", 60_000, () => videoBox(page));
+    let tried = 0;
+    const v = await until(
+      "the page's video",
+      90_000,
+      async () => {
+        const box = await videoBox(page);
+        if (box) return box;
+        if (Date.now() - tried > 6000) {
+          tried = Date.now();
+          const at = await startPlayback(page);
+          if (at) log(`clicked play at ${Math.round(at.x)},${Math.round(at.y)}${at.frame ? " (player frame)" : ""}`);
+        }
+        return null;
+      },
+      1000,
+    );
     log("video on the page");
     let lastSeen = "";
     let lastClick = Date.now();
