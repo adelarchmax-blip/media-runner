@@ -25,6 +25,9 @@ const CHROME = process.env.CHROME_BIN || "/usr/bin/google-chrome";
 const HOST = "com.misterdownloadmanager.host";
 const LOOKUP_MS = 180_000;
 const DOWNLOAD_MS = 40 * 60_000;
+// MDM's window looks up what the extension sent (often the stream's own address); after this
+// long without a result, the item's page address is given instead.
+const RETYPE_MS = 15_000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (msg) => console.error(`[grab] ${msg}`);
@@ -141,7 +144,7 @@ function mdmWindows() {
 // brought on screen, then its own buttons pressed, at their places in its fixed layout (fractions
 // of the window). First its look-up of the address the extension sent is waited for; when that
 // takes too long, the item's page address goes in its "Page address" box and "Look up" is
-// pressed. "Download Now" is pressed every few seconds (it stays greyed until the look-up ends).
+// pressed (RETYPE_MS). "Download Now" is pressed every few seconds (it stays greyed until the look-up ends).
 let windowsSeen = "";
 let shotWindow = false;
 let windowSince = 0;
@@ -166,7 +169,7 @@ function driveVideoWindow(pageUrl) {
   const g = /Position: (\d+),(\d+)[\s\S]*Geometry: (\d+)x(\d+)/.exec(x("getwindowgeometry", w.id));
   if (!g) return;
   const geo = { x: +g[1], y: +g[2], w: +g[3], h: +g[4] };
-  if (!retyped && Date.now() - windowSince > 40_000) {
+  if (!retyped && Date.now() - windowSince > RETYPE_MS) {
     retyped = true;
     clickIn(geo, 0.4, 37);
     x("key", "--clearmodifiers", "ctrl+a");
@@ -303,6 +306,28 @@ async function startPlayback(page) {
   return best;
 }
 
+// MDM is asked to quit through its API; whatever of its process group still runs after 10 s is
+// stopped, so the next item starts with a fresh app and nothing of this one answers the extension.
+async function stopApp(app) {
+  const gone = () => {
+    try {
+      process.kill(-app.pid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  for (let i = 0; i < 20 && !gone(); i++) await sleep(500);
+  for (const sig of ["SIGTERM", "SIGKILL"]) {
+    if (gone()) return;
+    try {
+      process.kill(-app.pid, sig);
+    } catch {}
+    for (let i = 0; i < 10 && !gone(); i++) await sleep(300);
+  }
+  if (!gone()) log("MDM did not stop");
+}
+
 async function main() {
   prepareData();
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "mdm-chrome-"));
@@ -310,7 +335,8 @@ async function main() {
   const env = { ...process.env, MDM_DATA_DIR: DATA, MDM_OFFSCREEN: "1" };
 
   fs.rmSync(path.join(DATA, "ipc.json"), { force: true });
-  const app = spawn("misterdownloadmanager", [], { env, stdio: "ignore" });
+  // Its own process group, so the app and every helper it starts are stopped together at the end.
+  const app = spawn("misterdownloadmanager", [], { env, stdio: "ignore", detached: true });
   let browser;
   try {
     await until("MDM to start", 30_000, () => mdmList().then(() => true));
@@ -392,7 +418,8 @@ async function main() {
           await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
           await sleep(4000);
         }
-        const got = (await mdmList()).find((d) => !before.has(d.id));
+        // MDM's API can stay silent while its window looks a page up; the window is still driven.
+        const got = (await mdmList().catch(() => [])).find((d) => !before.has(d.id));
         if (got) return got;
         if (Date.now() - lastTry > 25_000 && clicks < 4) {
           // The button shows while the pointer moves over the video (and fades 1.5 s after it rests).
@@ -451,8 +478,7 @@ async function main() {
   } finally {
     if (browser) await browser.close().catch(() => {});
     await ipc({ exit: true }).catch(() => {});
-    await sleep(1500);
-    app.kill();
+    await stopApp(app);
     fs.rmSync(profile, { recursive: true, force: true });
   }
 }

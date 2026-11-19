@@ -1,5 +1,7 @@
-import os
+import base64
+import functools
 import io
+import os
 import re
 import logging
 import requests
@@ -192,44 +194,122 @@ def _page_image(url: str) -> str:
         return ""
 
 
-def _encyclopedia_posters(title: str, year: int = None):
-    """Candidate posters for a work from its own encyclopedia article (Arabic, then English
-    Wikipedia). Only an article whose title is the work's title counts, and its Wikidata entry,
-    when it has a date, must have the work's year. From it, in order: the IMDb title's poster,
-    the Wikidata poster or image, the article's own image, then the picture each linked page
-    (film databases in its references) names for itself."""
+@functools.lru_cache(maxsize=64)
+def _articles(title: str, year: int = None) -> tuple:
+    """The work's own encyclopedia article(s), Arabic Wikipedia first, then English, as
+    (language, page, Wikidata claims). Only an article whose title is the work's title counts,
+    and its Wikidata entry, when it has a date, must have the work's year (±1)."""
     want = _norm(title)
+    found = []
     if not want:
-        return
+        return ()
     for lang in ("ar", "en"):
-        found = _json(f"https://{lang}.wikipedia.org/w/api.php", action="query", format="json", list="search",
-                      srsearch=f"{title} {year}" if year else title, srlimit=5).get("query", {}).get("search", [])
-        for hit in found:
+        hits = _json(f"https://{lang}.wikipedia.org/w/api.php", action="query", format="json", list="search",
+                     srsearch=f"{title} {year}" if year else title, srlimit=5).get("query", {}).get("search", [])
+        for hit in hits:
             if _norm(hit.get("title")) != want:
                 continue
             pages = _json(f"https://{lang}.wikipedia.org/w/api.php", action="query", format="json", titles=hit["title"],
-                          prop="pageprops|pageimages|extlinks", ppprop="wikibase_item", piprop="original",
-                          ellimit=50).get("query", {}).get("pages", {})
+                          prop="pageprops|pageimages|extlinks|extracts", ppprop="wikibase_item", piprop="original",
+                          ellimit=50, exintro=1, explaintext=1).get("query", {}).get("pages", {})
             for page in pages.values():
                 qid = (page.get("pageprops") or {}).get("wikibase_item")
-                claims = {}
-                if qid:
-                    claims = _json(f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json").get("entities", {}).get(qid, {}).get("claims", {})
-                values = lambda p: [(c.get("mainsnak", {}).get("datavalue") or {}).get("value") for c in claims.get(p, [])]
-                dates = [v.get("time", "")[1:5] for v in values("P577") if isinstance(v, dict)]
+                entity = _json(f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json").get("entities", {}).get(qid, {}) if qid else {}
+                claims = dict(entity.get("claims") or {})
+                arwiki = ((entity.get("sitelinks") or {}).get("arwiki") or {}).get("title")
+                if arwiki:
+                    claims["_arwiki"] = arwiki
+                dates = [v.get("time", "")[1:5] for v in _values(claims, "P577") if isinstance(v, dict)]
                 if year and dates and not any(_years_match(d, year) for d in dates):
                     continue
-                for tt in values("P345"):
-                    if isinstance(tt, str) and tt.startswith("tt"):
-                        yield _imdb_by_id(tt)
-                for name in values("P3383") + values("P18"):
-                    if isinstance(name, str):
-                        yield f"https://commons.wikimedia.org/wiki/Special:FilePath/{requests.utils.quote(name)}?width=1000"
-                yield (page.get("original") or {}).get("source", "")
-                for link in page.get("extlinks", []):
-                    href = link.get("*", "")
-                    if href.startswith("http") and not re.search(r"archive\.org|wiki[pm]edia\.org|wikidata\.org", href):
-                        yield _page_image(href)
+                found.append((lang, page, claims))
+    return tuple(found)
+
+
+def _values(claims: dict, prop: str) -> list:
+    return [(c.get("mainsnak", {}).get("datavalue") or {}).get("value") for c in claims.get(prop, [])]
+
+
+def _commons(name: str, width: int) -> str:
+    return f"https://commons.wikimedia.org/wiki/Special:FilePath/{requests.utils.quote(name)}?width={width}"
+
+
+def _encyclopedia_posters(title: str, year: int = None):
+    """Candidate posters from the work's article, in order: the IMDb title's poster, the Wikidata
+    poster or image, the article's own image, then the picture each linked page (film databases
+    in its references) names for itself."""
+    for _lang, page, claims in _articles(title, year):
+        for tt in _values(claims, "P345"):
+            if isinstance(tt, str) and tt.startswith("tt"):
+                yield _imdb_by_id(tt)
+        for name in _values(claims, "P3383") + _values(claims, "P18"):
+            if isinstance(name, str):
+                yield _commons(name, 1000)
+        yield (page.get("original") or {}).get("source", "")
+        for link in page.get("extlinks", []):
+            href = link.get("*", "")
+            if href.startswith("http") and not re.search(r"archive\.org|wiki[pm]edia\.org|wikidata\.org", href):
+                yield _page_image(href)
+
+
+def _people(claims: dict, prop: str, limit: int) -> list:
+    """Names (Arabic first) and photos of the people a Wikidata property lists (cast, director)."""
+    ids = [v.get("id") for v in _values(claims, prop) if isinstance(v, dict) and v.get("id")][:limit]
+    if not ids:
+        return []
+    entities = _json("https://www.wikidata.org/w/api.php", action="wbgetentities", ids="|".join(ids),
+                     props="labels|claims", languages="ar|en", format="json").get("entities", {})
+    people = []
+    for qid in ids:
+        e = entities.get(qid) or {}
+        labels = e.get("labels") or {}
+        name = (labels.get("ar") or labels.get("en") or {}).get("value")
+        if not name:
+            continue
+        photos = [p for p in _values(e.get("claims") or {}, "P18") if isinstance(p, str)]
+        people.append({"name": name[:80], "photo": _commons(photos[0], 200) if photos else ""})
+    return people
+
+
+def _short(text: str, limit: int = 700) -> str:
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind("."), cut.rfind("。"), cut.rfind("؟"))
+    return cut[: end + 1] if end > limit // 2 else cut.rstrip() + "…"
+
+
+def work_details(title: str, year: int = None) -> dict:
+    """What the dashboard shows about a work while it downloads: a short summary, the director
+    and the cast (names and photos), and the article it came from. Empty fields when the work
+    has no article."""
+    for q in _query_variants(title or ""):
+        arts = _articles(q, year)
+        if arts:
+            lang, page, claims = arts[0]
+            summary = page.get("extract", "")
+            if lang != "ar" and claims.get("_arwiki"):
+                # The same work's Arabic article, when it has one, gives the summary in Arabic.
+                pages = _json("https://ar.wikipedia.org/w/api.php", action="query", format="json", titles=claims["_arwiki"],
+                              prop="extracts", exintro=1, explaintext=1).get("query", {}).get("pages", {})
+                summary = next((p.get("extract") for p in pages.values() if p.get("extract")), summary)
+            return {
+                "summary": _short(summary),
+                "director": _people(claims, "P57", 3),
+                "cast": _people(claims, "P161", 10),
+                "link": f"https://{lang}.wikipedia.org/wiki/{requests.utils.quote(page.get('title', '').replace(' ', '_'))}",
+            }
+    return {"summary": "", "director": [], "cast": [], "link": ""}
+
+
+def poster_thumb(path: str) -> str:
+    """A small copy of the finished poster (240x360 JPEG, data URL) for the dashboard's live card."""
+    with Image.open(path) as img:
+        small = img.convert("RGB").resize((240, 360), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    small.save(buf, "JPEG", quality=72, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
 def _download_image(url: str, portrait: bool = False):

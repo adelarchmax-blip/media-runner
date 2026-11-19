@@ -11,6 +11,8 @@ import time
 
 import requests
 
+from poster import poster_thumb, process_poster, work_details
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 for noisy in ("urllib3", "requests", "PIL"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -162,6 +164,15 @@ def process(item: dict):
     try:
         folder, base_name, poster_folder = destination(item)
         progress.push(force=True)
+        # The poster and the work's details first, so the dashboard shows what is downloading.
+        local_poster = os.path.join(job_dir, "poster.jpg")
+        title, year = item.get("clean_title", ""), item.get("year")
+        has_poster = process_poster(item.get("poster_url") or "", local_poster, title=title, year=year)
+        try:
+            details = {**work_details(title, year), "poster_thumb": poster_thumb(local_poster) if has_poster else ""}
+            progress.push(force=True, details=details)
+        except Exception as e:
+            logging.warning(f"item {item_id}: no details ({type(e).__name__})")
         video = download(item, os.path.join(job_dir, base_name), progress)
         verify_video(video)
         progress.dl_pct = 100
@@ -170,13 +181,9 @@ def process(item: dict):
 
         # البوستر: للمسلسل في مجلد المسلسل نفسه (مرة واحدة)، وللفيلم/المسرحية في مجلده
         poster_remote = f"{poster_folder}/poster.jpg"
-        if not remote_exists(poster_remote):
-            from poster import process_poster
-            local_poster = os.path.join(job_dir, "poster.jpg")
-            if process_poster(item.get("poster_url") or "", local_poster, title=item.get("clean_title", ""),
-                              year=item.get("year")):
-                subprocess.run(["rclone", "copyto", local_poster, f"{REMOTE}:{poster_remote}"],
-                               check=True, capture_output=True)
+        if has_poster and not remote_exists(poster_remote):
+            subprocess.run(["rclone", "copyto", local_poster, f"{REMOTE}:{poster_remote}"],
+                           check=True, capture_output=True)
 
         ext = os.path.splitext(video)[1]
         remote_video = f"{folder}/{base_name}{ext}"

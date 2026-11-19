@@ -76,3 +76,37 @@ def test_web_search_off_without_its_address(monkeypatch):
 def test_web_search_survives_a_dead_search_service(monkeypatch):
     monkeypatch.setenv("SEARX_URL", "http://127.0.0.1:9")
     assert poster._web_posters("احمر شفايف", 1946) == []
+
+
+def test_people_read_names_and_photos(monkeypatch):
+    claims = {"P161": [{"mainsnak": {"datavalue": {"value": {"id": f"Q{i}"}}}} for i in (1, 2, 3)]}
+    entities = {"Q1": {"labels": {"ar": {"value": "شادية"}, "en": {"value": "Shadia"}},
+                       "claims": {"P18": [{"mainsnak": {"datavalue": {"value": "Shadia 1961.jpg"}}}]}},
+                "Q2": {"labels": {"en": {"value": "Only English"}}},
+                "Q3": {"labels": {}}}
+    monkeypatch.setattr(poster, "_json", lambda url, **p: {"entities": entities})
+    people = poster._people(claims, "P161", 10)
+    assert people[0]["name"] == "شادية" and people[0]["photo"].startswith("https://commons.wikimedia.org/")
+    assert people[1] == {"name": "Only English", "photo": ""}
+    assert len(people) == 2
+    assert poster._people({}, "P161", 10) == []
+
+
+def test_details_empty_without_an_article(monkeypatch):
+    monkeypatch.setattr(poster, "_json", lambda *a, **k: {})
+    poster._articles.cache_clear()
+    assert poster.work_details("عمل مالوش مقالة", 2001) == {"summary": "", "director": [], "cast": [], "link": ""}
+
+
+def test_summary_cut_at_a_sentence():
+    text = "جملة أولى طويلة شوية. " * 60
+    short = poster._short(text, 300)
+    assert len(short) <= 300 and short.endswith(".")
+    assert poster._short("قصير") == "قصير"
+
+
+def test_thumb_is_small_jpeg(tmp_path):
+    out = tmp_path / "p.jpg"
+    poster.compress_and_save_poster(poster.create_fallback_poster("اسم", 2000), str(out))
+    thumb = poster.poster_thumb(str(out))
+    assert thumb.startswith("data:image/jpeg;base64,") and len(thumb) < 80_000
