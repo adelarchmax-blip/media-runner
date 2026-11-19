@@ -140,116 +140,49 @@ function mdmWindows() {
     .map((id) => ({ id, name: spawnSync("xdotool", ["getwindowname", id], { encoding: "utf8" }).stdout.trim() }))
     .filter((w) => w.name && !/chrome|chromium/i.test(w.name));
 }
-// MDM's Download video window (a stream, or a page it has no one-click quality for) waits for
-// its Download button: Enter presses it, as a person would.
+// MDM's "Download video from a page" window (a stream, or a page with no one-click quality):
+// brought on screen, then its own buttons pressed, at their places in its fixed layout (fractions
+// of the window). First its look-up of the address the extension sent is waited for; when that
+// takes too long, the item's page address goes in its "Page address" box and "Look up" is
+// pressed. "Download Now" is pressed every few seconds (it stays greyed until the look-up ends).
 let windowsSeen = "";
 let shotWindow = false;
-function confirmVideoWindow() {
+let windowSince = 0;
+let retyped = false;
+function x(...args) {
+  return spawnSync("xdotool", args, { encoding: "utf8", timeout: 8000 }).stdout || "";
+}
+function clickIn(geo, fx, fy) {
+  x("mousemove", String(Math.round(geo.x + geo.w * fx)), String(Math.round(geo.y + fy)), "click", "1");
+}
+function driveVideoWindow(pageUrl) {
   const wins = mdmWindows();
   const names = wins.map((w) => w.name).join(" | ");
   if (names !== windowsSeen) log(`MDM windows: ${(windowsSeen = names) || "none"}`);
   // Any window of MDM's other than its main one ("Mister Download Manager <version>").
-  const w = wins.find((x) => !/^Mister Download Manager( [\d.]+)?$/i.test(x.name));
-  if (!w) return false;
-  // On the screen (MDM_OFFSCREEN keeps it off), focused, then Enter as typed on the keyboard.
-  spawnSync("xdotool", ["windowmove", w.id, "1300", "0"], { timeout: 5000 });
-  spawnSync("xdotool", ["windowraise", w.id], { timeout: 5000 });
-  spawnSync("xdotool", ["windowfocus", "--sync", w.id], { timeout: 5000 });
-  if (process.env.MDM_SHOTS && !shotWindow) {
-    shotWindow = true;
-    spawnSync("sleep", ["2"]);
-    spawnSync("ffmpeg", ["-loglevel", "error", "-y", "-f", "x11grab", "-video_size", "2400x1000", "-i", process.env.DISPLAY, "-frames:v", "1", path.join(process.env.MDM_SHOTS, "screen.png")], { timeout: 15000 });
+  const w = wins.find((v) => !/^Mister Download Manager( [\d.]+)?$/i.test(v.name));
+  if (!w) return;
+  if (!windowSince) windowSince = Date.now();
+  x("windowmove", w.id, "1300", "0");
+  x("windowraise", w.id);
+  x("windowfocus", "--sync", w.id);
+  const g = /Position: (\d+),(\d+)[\s\S]*Geometry: (\d+)x(\d+)/.exec(x("getwindowgeometry", w.id));
+  if (!g) return;
+  const geo = { x: +g[1], y: +g[2], w: +g[3], h: +g[4] };
+  if (!retyped && Date.now() - windowSince > 40_000) {
+    retyped = true;
+    clickIn(geo, 0.4, 37);
+    x("key", "--clearmodifiers", "ctrl+a");
+    x("type", "--delay", "5", pageUrl);
+    clickIn(geo, 0.88, 37);
+    log("MDM's look-up was slow: gave it the item's page address and pressed Look up");
   }
-  spawnSync("xdotool", ["key", "--clearmodifiers", "Return"], { timeout: 5000 });
-  log(`pressed Enter in "${w.name}"`);
-  return true;
-}
-
-// DevTools' copy of a frame's DOM, closed shadow trees included, with a few readers.
-async function domTree(frame) {
-  const { root } = await frame.client.send("DOM.getDocument", { depth: -1, pierce: true });
-  return root;
-}
-function findNode(n, test) {
-  if (test(n)) return n;
-  for (const k of [...(n.children || []), ...(n.shadowRoots || []), ...(n.contentDocument ? [n.contentDocument] : [])]) {
-    const f = findNode(k, test);
-    if (f) return f;
+  clickIn(geo, 0.54, geo.h - 23);
+  if (process.env.MDM_SHOTS && (!shotWindow || retyped === true)) {
+    shotWindow = retyped ? "after" : true;
+    spawnSync("ffmpeg", ["-loglevel", "error", "-y", "-f", "x11grab", "-video_size", "2400x1000", "-i", process.env.DISPLAY, "-frames:v", "1", path.join(process.env.MDM_SHOTS, retyped ? "screen-retyped.png" : "screen.png")], { timeout: 15000 });
+    if (retyped) retyped = "shot";
   }
-  return null;
-}
-function findAll(n, test, out = []) {
-  if (test(n)) out.push(n);
-  for (const k of [...(n.children || []), ...(n.shadowRoots || [])]) findAll(k, test, out);
-  return out;
-}
-function attrOf(n, name) {
-  const a = n.attributes || [];
-  for (let i = 0; i < a.length; i += 2) if (a[i] === name) return a[i + 1];
-  return null;
-}
-const classed = (c) => (n) => n.nodeType === 1 && (attrOf(n, "class") || "").split(/\s+/).includes(c);
-const textOf = (n) => (n.nodeType === 3 ? n.nodeValue : (n.children || []).map(textOf).join(""));
-async function centreOf(frame, node) {
-  const { model } = await frame.client.send("DOM.getBoxModel", { nodeId: node.nodeId });
-  const q = model.border;
-  const o = await frameOffset(frame);
-  return { x: (q[0] + q[4]) / 2 + o.x, y: (q[1] + q[5]) / 2 + o.y, w: model.width, h: model.height };
-}
-async function buttonFrame(page) {
-  for (const frame of page.frames()) {
-    const host = (await frame.$("mdm-video-button").catch(() => null)) || (await frame.$("pierce/mdm-video-button").catch(() => null));
-    if (host) return frame;
-  }
-  return null;
-}
-
-// The button's menu (its arrow): opened, its look-up waited for, then "Download best" (its first
-// line), which downloads with no question. Returns true once that line was clicked.
-async function downloadBestFromMenu(page) {
-  const frame = await buttonFrame(page);
-  if (!frame) return false;
-  const shadowOf = (root) => {
-    const host = findNode(root, (n) => n.localName === "mdm-video-button" && n.shadowRoots && n.shadowRoots.length);
-    return host && host.shadowRoots[0];
-  };
-  let shadow = shadowOf(await domTree(frame));
-  const more = shadow && findNode(shadow, classed("more"));
-  if (!more) return false;
-  const at = await centreOf(frame, more);
-  await page.mouse.move(at.x, at.y);
-  await sleep(300);
-  await page.mouse.click(at.x, at.y);
-  log("opened the button's menu");
-  const best = await until(
-    "the menu's qualities",
-    LOOKUP_MS,
-    async () => {
-      // Keep the pointer on the menu so it stays open.
-      shadow = shadowOf(await domTree(frame));
-      const menu = shadow && findNode(shadow, (n) => classed("menu")(n) && classed("open")(n));
-      if (!menu) {
-        await page.mouse.move(at.x, at.y);
-        return null;
-      }
-      const rows = findNode(menu, classed("rows"));
-      if (!rows || findNode(rows, classed("skrow"))) return null;
-      const lines = findAll(rows, (n) => n.localName === "button");
-      if (!lines.length) {
-        const note = findNode(menu, classed("note"));
-        throw Object.assign(new Error(`no qualities: ${note ? textOf(note).trim() : "?"}`), { fatal: true });
-      }
-      log(`menu: ${lines.slice(0, 4).map((l) => textOf(l).replace(/\s+/g, " ").trim()).join(" | ")}`);
-      return lines.find(classed("top")) || lines[0];
-    },
-    800,
-  );
-  const p = await centreOf(frame, best);
-  await page.mouse.move(p.x, p.y);
-  await sleep(200);
-  await page.mouse.click(p.x, p.y);
-  log("clicked Download best");
-  return true;
 }
 
 // The button's closed shadow tree, read from DevTools' copy of the frame's DOM (attributes and
@@ -485,9 +418,9 @@ async function main() {
             if (clicks === 1 && process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "clicked.png") }).catch(() => {});
           }
         }
-        if (clicks && Date.now() - lastEnter > 6000) {
+        if (clicks && Date.now() - lastEnter > 5000) {
           lastEnter = Date.now();
-          confirmVideoWindow();
+          driveVideoWindow(startUrl);
         }
         return null;
       },
