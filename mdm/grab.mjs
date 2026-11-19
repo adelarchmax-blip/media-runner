@@ -245,6 +245,7 @@ const AD = /doubleclick|2mdn\.net|googlesyndication|imasdk|googleads|adservice|a
 
 // The biggest visible video in any frame (not an ad's), its centre in the page's viewport.
 async function videoBox(page) {
+  await centerPlayer(page);
   let best = null;
   for (const frame of page.frames()) {
     if (AD.test(frame.url())) continue;
@@ -344,6 +345,23 @@ async function useServer(page, link) {
     .catch(() => {});
 }
 
+// General rule for any site: the player (the biggest visible video or player-sized iframe of the
+// page) is scrolled to the middle of the screen when part of it is out of view, so clicks and the
+// pointer over it land on the player itself (players below the fold get neither otherwise).
+async function centerPlayer(page) {
+  await page
+    .evaluate(() => {
+      const els = [...document.querySelectorAll("video, iframe")]
+        .map((e) => [e, e.getBoundingClientRect()])
+        .filter(([e, r]) => r.width >= 300 && r.height >= 150 && getComputedStyle(e).visibility !== "hidden")
+        .sort((a, b) => b[1].width * b[1].height - a[1].width * a[1].height);
+      if (!els.length) return;
+      const [e, r] = els[0];
+      if (r.top < 0 || r.bottom > innerHeight) e.scrollIntoView({ block: "center", inline: "center" });
+    })
+    .catch(() => {});
+}
+
 // Whether the site's robots.txt ("User-agent: *" group) disallows this address's path.
 async function robotsClosed(page, href) {
   const u = new URL(href);
@@ -380,6 +398,7 @@ async function robotsClosed(page, href) {
 // In every frame, the biggest visible play control (by its label, title, class or words);
 // else the centre of the biggest player-like iframe. Returns where it clicked, in the page.
 async function startPlayback(page) {
+  await centerPlayer(page);
   let best = null;
   for (const frame of page.frames()) {
     const r = await frame
