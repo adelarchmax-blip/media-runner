@@ -1,0 +1,14 @@
+# SearXNG, run on the runner only while it works, for picture searches across many engines at
+# once (the poster engine's last online source). Listens on the runner's loopback only.
+use_default_settings: true
+general:
+  instance_name: "media-runner"
+server:
+  limiter: false
+  image_proxy: false
+  public_instance: false
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json

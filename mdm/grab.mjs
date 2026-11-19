@@ -66,31 +66,28 @@ async function mdmList() {
   return a.downloads;
 }
 
-// The app's settings before its first start: the automation API on, no first-run windows,
-// downloads into outDir.
+// The app's settings before each start: the automation API on, no first-run windows, and
+// downloads into this item's outDir (each item has its own folder, removed after its upload, so
+// the folder is set again for every item while the rest of the app's data is kept).
 function prepareData() {
   fs.mkdirSync(DATA, { recursive: true });
   fs.mkdirSync(outDir, { recursive: true });
   const file = path.join(DATA, "downloads.json");
-  if (fs.existsSync(file)) return;
-  const dirs = ["General", "Compressed", "Documents", "Music", "Programs", "Video"].map((c) => [c, outDir]);
-  fs.writeFileSync(
-    file,
-    JSON.stringify({
-      next_id: 1,
-      items: [],
-      version: 2,
-      settings: {
-        language: "en",
-        language_asked: true,
-        extension_never_ask: true,
-        show_start_dialog: false,
-        automation_api: true,
-        category_dirs: dirs,
-        torrent_handler: false,
-      },
-    }),
-  );
+  let data = { next_id: 1, items: [], version: 2, settings: {} };
+  try {
+    data = { ...data, ...JSON.parse(fs.readFileSync(file, "utf8")) };
+  } catch {}
+  data.settings = {
+    ...data.settings,
+    language: "en",
+    language_asked: true,
+    extension_never_ask: true,
+    show_start_dialog: false,
+    automation_api: true,
+    category_dirs: ["General", "Compressed", "Documents", "Music", "Programs", "Video"].map((c) => [c, path.resolve(outDir)]),
+    torrent_handler: false,
+  };
+  fs.writeFileSync(file, JSON.stringify(data));
 }
 
 // The native messaging host for Chrome: registered by MDM's own helper, then copied into the

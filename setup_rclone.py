@@ -31,7 +31,7 @@ def setup_rclone():
                 config_content = decoded
             else:
                 config_content = raw_data
-        except Exception as e:
+        except ValueError:  # not Base64: the secret holds the config as plain text
             config_content = raw_data
 
     # التأكد من إنشاء مسار التكوين
@@ -39,15 +39,17 @@ def setup_rclone():
     os.makedirs(config_dir, exist_ok=True)
     config_path = os.path.join(config_dir, "rclone.conf")
 
-    with open(config_path, "w", encoding="utf-8") as f:
+    # The config holds Drive tokens: readable by this user only.
+    with open(os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
         f.write(config_content.strip() + "\n")
+    os.chmod(config_path, 0o600)
 
     # فحص صلاحية التكوين باستخدام rclone listremotes
     try:
         res = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True, check=True)
         print(f"✅ rclone configured ({len(res.stdout.split())} remote(s)).")
     except subprocess.CalledProcessError as err:
-        print("❌ فشل تحميل ملف إعدادات rclone. يرجى التأكد من صحة النص أو ترميز Base64 المخزن في الخزنة المشفرة.")
+        print(f"❌ (rclone exit {err.returncode}) فشل تحميل ملف إعدادات rclone. يرجى التأكد من صحة النص أو ترميز Base64 المخزن في الخزنة المشفرة.")
         sys.exit(1)
 
 if __name__ == "__main__":

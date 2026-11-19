@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import logging
 import requests
 from PIL import Image, ImageFilter, ImageEnhance
@@ -16,6 +17,8 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
 }
+# Public APIs (Wikipedia, Wikidata, IMDb's feed) ask clients to name themselves.
+API_HEADERS = {"User-Agent": "media-runner/1.0 (+https://github.com/adelarchmax-blip/media-runner)"}
 
 def normalize_poster_dimensions(img: Image.Image, target_w: int = JELLYFIN_RATIO_W, target_h: int = JELLYFIN_RATIO_H) -> Image.Image:
     """
@@ -79,119 +82,235 @@ def compress_and_save_poster(img: Image.Image, output_path: str, max_bytes: int 
         f.write(buf.getvalue())
     return True
 
-def create_fallback_poster(title: str = "Media") -> Image.Image:
-    """توليد غلاف سينمائي بديل أنيق بنسبة 2:3 بدقة 1000x1500 عند تعذر سحب البوستر الأصلي"""
-    img = Image.new("RGB", (JELLYFIN_RATIO_W, JELLYFIN_RATIO_H), color=(15, 23, 42))
-    # تدرج لوني سينمائي ناعم
+def _font(size: int):
+    """A font with Arabic letters, found through fontconfig; Pillow's own font when there is none."""
+    from PIL import ImageFont
+    try:
+        import subprocess
+        path = subprocess.run(["fc-match", "-f", "%{file}", "sans:lang=ar"], capture_output=True, text=True, timeout=5).stdout.strip()
+        if path:
+            return ImageFont.truetype(path, size)
+    except Exception:
+        pass
+    return ImageFont.load_default(size)
+
+
+def _wrap(draw, text: str, font, width: int) -> list:
+    lines, line = [], ""
+    for word in text.split():
+        trial = f"{line} {word}".strip()
+        if line and draw.textlength(trial, font=font) > width:
+            lines.append(line)
+            line = word
+        else:
+            line = trial
+    return lines + ([line] if line else [])
+
+
+def create_fallback_poster(title: str = "", year: int = None) -> Image.Image:
+    """A 2:3 poster made here when no picture of the work exists anywhere: the title and year
+    written on a soft gradient, so the work is still recognisable in the library."""
     from PIL import ImageDraw
+    img = Image.new("RGB", (JELLYFIN_RATIO_W, JELLYFIN_RATIO_H), color=(15, 23, 42))
     draw = ImageDraw.Draw(img)
     for y in range(JELLYFIN_RATIO_H):
-        r = int(15 + (y / JELLYFIN_RATIO_H) * 20)
-        g = int(23 + (y / JELLYFIN_RATIO_H) * 35)
-        b = int(42 + (y / JELLYFIN_RATIO_H) * 60)
-        draw.line([(0, y), (JELLYFIN_RATIO_W, y)], fill=(r, g, b))
-    # إطار جمالي خارجي
+        draw.line([(0, y), (JELLYFIN_RATIO_W, y)],
+                  fill=(int(15 + y / JELLYFIN_RATIO_H * 20), int(23 + y / JELLYFIN_RATIO_H * 35), int(42 + y / JELLYFIN_RATIO_H * 60)))
     draw.rectangle([(20, 20), (JELLYFIN_RATIO_W - 20, JELLYFIN_RATIO_H - 20)], outline=(56, 189, 248), width=3)
+    font = _font(72)
+    lines = _wrap(draw, (title or "").strip(), font, JELLYFIN_RATIO_W - 140)[:5]
+    y = JELLYFIN_RATIO_H // 2 - len(lines) * 50
+    for line in lines:
+        draw.text((JELLYFIN_RATIO_W // 2, y), line, font=font, fill=(241, 245, 249), anchor="mm")
+        y += 100
+    if year:
+        draw.text((JELLYFIN_RATIO_W // 2, y + 20), str(year), font=_font(52), fill=(56, 189, 248), anchor="mm")
     return img
 
-import re
 
 def imdb_high_res(url: str, width: int = 1000) -> str:
-    """روابط IMDb تقبل تحديد الدقة: نطلب عرض 1000 بكسل بدلاً من الصورة المصغرة"""
+    """IMDb image addresses take a width: ask for 1000 px instead of the thumbnail."""
     return re.sub(r"\._V1_.*?\.(jpg|png)$", rf"._V1_SX{width}.\1", url) if "media-amazon.com" in url else url
 
-def fetch_imdb_poster(title: str, year: int = None) -> str:
-    """البحث التلقائي عن بوستر الفيلم أو المسلسل الرسمي عبر قاعدة بيانات IMDb عند عدم توفره في الموقع المصدر"""
-    if not title:
-        return ""
+
+def _norm(text: str) -> str:
+    """A title reduced for comparison: no brackets, diacritics, punctuation, or Arabic letter variants."""
+    text = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", text or "")
+    text = re.sub(r"[ً-ْـ]", "", text)
+    text = text.translate(str.maketrans("أإآٱةى", "ااااهي"))
+    text = re.sub(r"[^\w\s]", " ", text.lower())
+    return " ".join(text.split())
+
+
+def _years_match(found, year) -> bool:
     try:
-        import urllib.parse
-        clean_q = title.strip()
-        # إزالة الكلمات الزائدة لتحسين دقة البحث
-        clean_q = re.sub(r"^(?:فيلم|مسلسل|مسرحية|عرض)\s+", "", clean_q, flags=re.IGNORECASE).strip()
-        clean_q = re.sub(r"\s+(?:مترجم|مدبلج|كامل|HD|FHD).*$", "", clean_q, flags=re.IGNORECASE).strip()
-        query_encoded = urllib.parse.quote(clean_q)
-        url = f"https://v3.sg.media-imdb.com/suggestion/x/{query_encoded}.json"
-        
-        resp = requests.get(url, headers=HEADERS, timeout=6)
-        if resp.status_code == 200:
-            data = resp.json()
-            results = data.get("d", [])
-            for res in results:
-                img_obj = res.get("i")
-                if img_obj and img_obj.get("imageUrl"):
-                    item_year = res.get("y")
-                    if year and item_year and abs(int(item_year) - int(year)) > 2:
-                        continue
-                    poster_url = imdb_high_res(img_obj["imageUrl"])
-                    logging.debug("imdb poster found")
-                    return poster_url
-            for res in results:
-                img_obj = res.get("i")
-                if img_obj and img_obj.get("imageUrl"):
-                    poster_url = imdb_high_res(img_obj["imageUrl"])
-                    logging.debug("imdb poster found")
-                    return poster_url
-    except Exception as e:
-        logging.debug("imdb lookup failed")
+        return not year or not found or abs(int(found) - int(year)) <= 1
+    except (TypeError, ValueError):
+        return True
+
+
+def _json(url: str, **params):
+    try:
+        resp = requests.get(url, headers=API_HEADERS, params=params or None, timeout=10)
+        return resp.json() if resp.status_code == 200 else {}
+    except (requests.RequestException, ValueError):
+        return {}
+
+
+def _imdb_by_id(tt: str) -> str:
+    """The poster of one IMDb title, through IMDb's public suggestion feed."""
+    for d in _json(f"https://v3.sg.media-imdb.com/suggestion/t/{tt}.json").get("d", []):
+        if d.get("id") == tt and (d.get("i") or {}).get("imageUrl"):
+            return imdb_high_res(d["i"]["imageUrl"])
     return ""
 
-def _download_image(url: str):
+
+def fetch_imdb_poster(title: str, year: int = None) -> str:
+    """IMDb's poster for a title. With a known year, only a result of that year (±1) counts."""
+    if not title:
+        return ""
+    import urllib.parse
+    q = re.sub(r"^(?:فيلم|مسلسل|مسرحية|عرض)\s+", "", title.strip(), flags=re.IGNORECASE)
+    q = re.sub(r"\s+(?:مترجم|مدبلج|كامل|HD|FHD).*$", "", q, flags=re.IGNORECASE).strip()
+    for d in _json(f"https://v3.sg.media-imdb.com/suggestion/x/{urllib.parse.quote(q)}.json").get("d", []):
+        img = (d.get("i") or {}).get("imageUrl")
+        if img and (d.get("y") if year else True) and _years_match(d.get("y"), year):
+            return imdb_high_res(img)
+    return ""
+
+
+def _page_image(url: str) -> str:
+    """The picture a web page names for itself (og:image / twitter:image)."""
+    try:
+        resp = requests.get(url, headers={**HEADERS, "Accept": "text/html"}, timeout=10)
+        if resp.status_code != 200 or "html" not in resp.headers.get("Content-Type", ""):
+            return ""
+        m = re.search(r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]*content=["\']([^"\']+)', resp.text[:200_000], re.I) \
+            or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\'](?:og:image|twitter:image)["\']', resp.text[:200_000], re.I)
+        return requests.compat.urljoin(url, m.group(1)) if m else ""
+    except requests.RequestException:
+        return ""
+
+
+def _encyclopedia_posters(title: str, year: int = None):
+    """Candidate posters for a work from its own encyclopedia article (Arabic, then English
+    Wikipedia). Only an article whose title is the work's title counts, and its Wikidata entry,
+    when it has a date, must have the work's year. From it, in order: the IMDb title's poster,
+    the Wikidata poster or image, the article's own image, then the picture each linked page
+    (film databases in its references) names for itself."""
+    want = _norm(title)
+    if not want:
+        return
+    for lang in ("ar", "en"):
+        found = _json(f"https://{lang}.wikipedia.org/w/api.php", action="query", format="json", list="search",
+                      srsearch=f"{title} {year}" if year else title, srlimit=5).get("query", {}).get("search", [])
+        for hit in found:
+            if _norm(hit.get("title")) != want:
+                continue
+            pages = _json(f"https://{lang}.wikipedia.org/w/api.php", action="query", format="json", titles=hit["title"],
+                          prop="pageprops|pageimages|extlinks", ppprop="wikibase_item", piprop="original",
+                          ellimit=50).get("query", {}).get("pages", {})
+            for page in pages.values():
+                qid = (page.get("pageprops") or {}).get("wikibase_item")
+                claims = {}
+                if qid:
+                    claims = _json(f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json").get("entities", {}).get(qid, {}).get("claims", {})
+                values = lambda p: [(c.get("mainsnak", {}).get("datavalue") or {}).get("value") for c in claims.get(p, [])]
+                dates = [v.get("time", "")[1:5] for v in values("P577") if isinstance(v, dict)]
+                if year and dates and not any(_years_match(d, year) for d in dates):
+                    continue
+                for tt in values("P345"):
+                    if isinstance(tt, str) and tt.startswith("tt"):
+                        yield _imdb_by_id(tt)
+                for name in values("P3383") + values("P18"):
+                    if isinstance(name, str):
+                        yield f"https://commons.wikimedia.org/wiki/Special:FilePath/{requests.utils.quote(name)}?width=1000"
+                yield (page.get("original") or {}).get("source", "")
+                for link in page.get("extlinks", []):
+                    href = link.get("*", "")
+                    if href.startswith("http") and not re.search(r"archive\.org|wiki[pm]edia\.org|wikidata\.org", href):
+                        yield _page_image(href)
+
+
+def _download_image(url: str, portrait: bool = False):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=12)
         if resp.status_code == 200 and resp.headers.get("Content-Type", "").startswith("image"):
             img = Image.open(io.BytesIO(resp.content))
             img.load()
-            return img if img.size[0] >= MIN_SOURCE_WIDTH else None
+            w, h = img.size
+            if w >= MIN_SOURCE_WIDTH and (not portrait or h >= w * 1.2):
+                return img
     except Exception:
         return None
     return None
 
 
 def _query_variants(title: str) -> list:
-    """صيغ بحث متعددة: الاسم كاملاً، الجزء اللاتيني فقط، الجزء العربي فقط"""
+    """Search forms: the whole title, its Latin part alone, its Arabic part alone."""
     variants = [title]
     latin = " ".join(re.findall(r"[A-Za-z0-9][A-Za-z0-9'&:.-]*", title)).strip()
-    arabic = " ".join(re.findall(r"[\u0600-\u06FF0-9]+", title)).strip()
+    arabic = " ".join(re.findall(r"[؀-ۿ0-9]+", title)).strip()
     for v in (latin, arabic):
         if v and len(v) > 2 and v not in variants:
             variants.append(v)
     return variants
 
 
-def _wikipedia_image(query: str) -> str:
-    """صورة العمل من ويكيبيديا (عربي ثم إنجليزي) كمصدر بديل مجاني بلا مفاتيح"""
-    for lang in ("ar", "en"):
-        try:
-            r = requests.get(f"https://{lang}.wikipedia.org/w/api.php", headers=HEADERS, timeout=8, params={
-                "action": "query", "format": "json", "generator": "search", "gsrsearch": query, "gsrlimit": 1,
-                "prop": "pageimages", "piprop": "original"})
-            pages = (r.json().get("query") or {}).get("pages") or {}
-            for p in pages.values():
-                src = (p.get("original") or {}).get("source")
-                if src:
-                    return src
-        except Exception:
-            continue
-    return ""
+def _web_posters(title: str, year: int = None) -> list:
+    """Poster pictures from a search across many engines at once (SearXNG on the runner, at
+    SEARX_URL). A result counts only when its own title names every word of the work's title,
+    names no other year (±1), and the picture is portrait; results more engines agree on, and
+    those naming the year, come first."""
+    base = os.environ.get("SEARX_URL", "").rstrip("/")
+    want = _norm(title).split()
+    if not base or not want:
+        return []
+    arabic = re.search(r"[\u0600-\u06FF]", title)
+    queries = [f"{title} {year or ''} poster".strip(), f"{'بوستر فيلم' if arabic else 'movie poster'} {title} {year or ''}".strip()]
+    scored = {}
+    for q in queries:
+        for r in _json(f"{base}/search", q=q, categories="images", format="json", safesearch=1).get("results", []):
+            src, label = r.get("img_src") or "", _norm(f"{r.get('title', '')} {r.get('content', '')}")
+            if not src.startswith("http") or not all(w in label.split() for w in want):
+                continue
+            years = re.findall(r"\b(19\d\d|20\d\d)\b", label)
+            if year and years and not any(_years_match(y, year) for y in years):
+                continue
+            size = re.match(r"(\d+)\s*x\s*(\d+)", r.get("resolution") or "")
+            if size and int(size.group(2)) < int(size.group(1)) * 1.2:
+                continue
+            score = len(r.get("engines") or [r.get("engine")]) + (2 if year and str(year) in years else 0)
+            scored[src] = max(scored.get(src, 0), score)
+    return sorted(scored, key=scored.get, reverse=True)[:10]
 
 
 def find_best_poster(source: str, title: str, year: int = None):
-    """ترتيب المصادر: صورة الموقع (إن كانت بدقة كافية) ← IMDb بعدة صيغ ← ويكيبيديا ← None"""
+    """Sources in order: the site's own picture (when sharp enough) → the work's encyclopedia
+    article and what it links to (only portrait pictures, which posters are) → IMDb by title and
+    year → a picture search across many search engines → None."""
     if source and source.startswith("http"):
         img = _download_image(imdb_high_res(source))
         if img:
             return img
+    seen = set()
+    for q in _query_variants(title or ""):
+        for url in _encyclopedia_posters(q, year):
+            if url and url not in seen:
+                seen.add(url)
+                img = _download_image(url, portrait=True)
+                if img:
+                    return img
     for q in _query_variants(title or ""):
         url = fetch_imdb_poster(q, year)
-        if url:
-            img = _download_image(url)
+        if url and url not in seen:
+            seen.add(url)
+            img = _download_image(url, portrait=True)
             if img:
                 return img
-    for q in _query_variants(title or ""):
-        url = _wikipedia_image(f"{q} {year}" if year else q)
-        if url:
-            img = _download_image(url)
+    for url in _web_posters(title or "", year):
+        if url not in seen:
+            img = _download_image(url, portrait=True)
             if img:
                 return img
     return None
@@ -200,59 +319,12 @@ def find_best_poster(source: str, title: str, year: int = None):
 def process_poster(source: str, output_path: str, title: str = "", year: int = None) -> bool:
     """بوستر Jellyfin: أفضل صورة متاحة، مطبّعة لـ 2:3 كاملة بلا قص أو مط، خفيفة الحجم"""
     try:
-        img = find_best_poster(source, title, year) or create_fallback_poster(title)
+        img = find_best_poster(source, title, year) or create_fallback_poster(title, year)
         return compress_and_save_poster(normalize_poster_dimensions(img), output_path)
     except Exception as e:
         logging.error(f"poster processing failed ({type(e).__name__})")
         return False
 
-
-def _legacy_process_poster(source: str, output_path: str, title: str = "", year: int = None) -> bool:
-    """
-    معالجة شاملة للبوستر من رابط ويب أو مسار محلي أو البحث عنه في IMDb وحفظه كـ poster.jpg مطابق لجيلي فين بنسبة 2:3 وحجم < 1 ميجابايت.
-    """
-    try:
-        img = None
-        target_source = source
-
-        # إذا كان الرابط غير متوفر أو افتراضي: البحث الفوري في IMDb
-        if not target_source or target_source == "/logo.png" or not target_source.startswith("http"):
-            if title:
-                logging.debug("imdb lookup")
-                imdb_url = fetch_imdb_poster(title, year)
-                if imdb_url:
-                    target_source = imdb_url
-
-        if target_source and (target_source.startswith("http://") or target_source.startswith("https://")):
-            try:
-                resp = requests.get(target_source, headers=HEADERS, timeout=12)
-                if resp.status_code == 200:
-                    img_data = io.BytesIO(resp.content)
-                    img = Image.open(img_data)
-                else:
-                    logging.warning(f"⚠️ تعذر جلب البوستر (كود {resp.status_code})، محاولة البحث البديل في IMDb...")
-                    if title and target_source != source:
-                        imdb_url = fetch_imdb_poster(title, year)
-                        if imdb_url:
-                            resp_imdb = requests.get(imdb_url, headers=HEADERS, timeout=12)
-                            if resp_imdb.status_code == 200:
-                                img = Image.open(io.BytesIO(resp_imdb.content))
-                    if not img:
-                        img = create_fallback_poster(title)
-            except Exception as net_err:
-                logging.warning(f"poster download failed ({type(net_err).__name__}); using fallback")
-                img = create_fallback_poster(title)
-        elif target_source and os.path.exists(target_source):
-            img = Image.open(target_source)
-        else:
-            img = create_fallback_poster(title)
-
-        normalized = normalize_poster_dimensions(img)
-        return compress_and_save_poster(normalized, output_path)
-
-    except Exception as e:
-        logging.error(f"poster processing failed ({type(e).__name__})")
-        return False
 
 if __name__ == "__main__":
     # اختبار ذاتي سريع
