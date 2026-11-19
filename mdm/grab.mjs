@@ -159,6 +159,16 @@ async function readButton(frame, host) {
   }
 }
 
+// Where the extension's button shows, in the page (its host element is ours to measure).
+async function hostBox(page) {
+  for (const frame of page.frames()) {
+    const host = (await frame.$("mdm-video-button").catch(() => null)) || (await frame.$("pierce/mdm-video-button").catch(() => null));
+    const box = host && (await host.boundingBox().catch(() => null));
+    if (box && box.width > 40 && box.height > 16) return box;
+  }
+  return null;
+}
+
 // Ad networks' players and clips (any site): their videos are never the item.
 const AD = /doubleclick|2mdn\.net|googlesyndication|imasdk|googleads|adservice|adnxs|springserve|spotx|teads|\/ads?\//i;
 
@@ -281,37 +291,44 @@ async function main() {
     );
     log("video on the page");
     let lastSeen = "";
-    let lastClick = Date.now();
     if (process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "page.png") }).catch(() => {});
 
     // The pointer over the video brings the button; it looks the video up, then names the best
     // quality on its chip ("ready").
-    const ready = await until(
-      "the extension's button to be ready",
+    // The pointer over the video brings the extension's button. When its state can be read, it is
+    // clicked once it names the best quality ("ready"); when the page hides it from us, it is
+    // clicked where it shows (its left part, "Download video") after the look-up's time. Done once
+    // MDM's own list has the download; clicked again every 20 s, at most 4 times.
+    let firstSeen = 0;
+    let lastTry = 0;
+    let clicks = 0;
+    const item = await until(
+      "the extension's button and MDM taking the video",
       LOOKUP_MS,
       async () => {
-        // A player that waits for its play button: one real click on the video every 15 s.
-        if (Date.now() - lastClick > 15_000) {
-          lastClick = Date.now();
-          await page.mouse.click(v.x, v.y);
-        }
         await page.mouse.move(v.x + (Date.now() % 3), v.y);
         const s = await buttonState(page);
-        const seen = s ? `${s.state} "${s.label}" "${s.chip}"` : "no button";
+        const box = s ? null : await hostBox(page);
+        const seen = s ? `${s.state} "${s.label}" "${s.chip}"` : box ? "shown (state hidden)" : "no button";
         if (seen !== lastSeen) log(`button: ${(lastSeen = seen)}`);
         if (s && ["err", "drm", "off"].includes(s.state)) throw Object.assign(new Error(`button: ${s.state} ${s.label}`), { fatal: true });
-        return s && s.state === "ready" && s.chip && s.w ? s : null;
+        const at = s
+          ? s.state === "ready" && s.chip && s.w ? { x: s.x, y: s.y } : null
+          : box ? { x: box.x + Math.min(box.width * 0.35, 70), y: box.y + box.height / 2 } : null;
+        if (at && !firstSeen) firstSeen = Date.now();
+        if (at && (s || Date.now() - firstSeen > 8000) && Date.now() - lastTry > 20_000 && clicks < 4) {
+          lastTry = Date.now();
+          clicks += 1;
+          await page.mouse.move(at.x, at.y);
+          await sleep(200);
+          await page.mouse.click(at.x, at.y);
+          log(`clicked the extension's button (${clicks})`);
+          if (clicks === 1 && process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "clicked.png") }).catch(() => {});
+        }
+        return (await mdmList()).find((d) => !before.has(d.id)) || null;
       },
       700,
     );
-    log(`button ready: ${ready.chip}`);
-    await page.mouse.move(ready.x, ready.y);
-    await sleep(150);
-    const now = (await buttonState(page)) || ready;
-    await page.mouse.click(now.x, now.y);
-    log("clicked");
-
-    const item = await until("the download in MDM's list", 60_000, async () => (await mdmList()).find((d) => !before.has(d.id)));
     log(`MDM took it (#${item.id})`);
     let last = "";
     const done = await until(
