@@ -95,27 +95,56 @@ class Progress:
                    size_mb=round(self.size_mb, 1), **extra)
 
 
+_URL = re.compile(r"\S*(?:https?://|www\.)\S*", re.I)
+
+
+def last_steps(log_path: str, count: int = 15) -> list:
+    """The download script's last steps, for the log of a failed item: only its own `[grab]` lines,
+    each cut short and with any web address removed (the log is public)."""
+    try:
+        with open(log_path, errors="replace") as f:
+            lines = [ln.strip() for ln in f if ln.startswith("[grab]")]
+    except OSError:
+        return []
+    return [_URL.sub("<address>", ln)[:160] for ln in lines[-count:]]
+
+
+def stop_leftover_mdm():
+    """Mister Download Manager stops itself after each item; whatever of it still runs is stopped
+    here, so the next item starts with a fresh app."""
+    left = subprocess.run(["pgrep", "-i", "misterdownload"], capture_output=True, text=True).stdout.split()
+    if left:
+        logging.warning(f"MDM left {len(left)} process(es) running: stopping them")
+        subprocess.run(["pkill", "-KILL", "-i", "misterdownload"], capture_output=True)
+
+
 def download(item: dict, out_base: str, progress: Progress) -> str:
     """التحميل عبر إضافة Mister Download Manager الرسمية داخل كروم، والبرنامج نفسه ينزّل الملف"""
     out_dir = os.path.dirname(out_base) + "/mdm"
     os.makedirs(out_dir, exist_ok=True)
-    proc = subprocess.Popen(["xvfb-run", "-a", "-s", "-screen 0 2400x1000x24", "node", MDM_GRAB, item["watch_url"], out_dir],
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    result = {}
-    for line in proc.stdout:
-        try:
-            msg = json.loads(line)
-        except ValueError:
-            continue
-        if "progress" in msg:
-            progress.dl_pct = max(0, msg["progress"])
-            progress.speed = (msg.get("speed") or 0) / 1048576
-            progress.push()
-        else:
-            result = msg
-    proc.wait()
+    steps_log = os.path.dirname(out_base) + "/grab.log"
+    with open(steps_log, "w") as steps:
+        proc = subprocess.Popen(["xvfb-run", "-a", "-s", "-screen 0 2400x1000x24", "node", MDM_GRAB, item["watch_url"], out_dir],
+                                stdout=subprocess.PIPE, stderr=steps, text=True)
+        result = {}
+        for line in proc.stdout:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if "progress" in msg:
+                progress.dl_pct = max(0, msg["progress"])
+                progress.speed = (msg.get("speed") or 0) / 1048576
+                progress.push()
+            else:
+                result = msg
+        proc.wait()
+    stop_leftover_mdm()
     if not result.get("ok"):
-        raise RuntimeError(f"MDM: {result.get('error', 'no result')}")
+        steps_seen = last_steps(steps_log)
+        for step in steps_seen:
+            logging.info(f"  {step}")
+        raise RuntimeError(f"MDM: {result.get('error', 'no result')} | " + " ; ".join(steps_seen[-6:]))
     src = result["path"]
     progress.size_mb = os.path.getsize(src) / 1048576
     dst = out_base + os.path.splitext(src)[1]
