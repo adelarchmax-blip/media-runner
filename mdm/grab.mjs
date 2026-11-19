@@ -172,6 +172,8 @@ async function main() {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
     const v = await until("the page's video", 60_000, () => videoBox(page));
     log("video on the page");
+    let lastSeen = "";
+    if (process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "page.png") }).catch(() => {});
 
     // The pointer over the video brings the button; it looks the video up, then names the best
     // quality on its chip ("ready").
@@ -181,6 +183,8 @@ async function main() {
       async () => {
         await page.mouse.move(v.x + (Date.now() % 3), v.y);
         const s = await buttonState(page, cdp);
+        const seen = s ? `${s.state} "${s.label}" "${s.chip}"` : "no button";
+        if (seen !== lastSeen) log(`button: ${(lastSeen = seen)}`);
         if (s && ["err", "drm", "off"].includes(s.state)) throw Object.assign(new Error(`button: ${s.state} ${s.label}`), { fatal: true });
         return s && s.state === "ready" && s.chip && s.w ? s : null;
       },
@@ -226,5 +230,5 @@ async function main() {
 
 main().catch((e) => {
   console.log(JSON.stringify({ ok: false, error: String(e.message || e).slice(0, 300) }));
-  process.exit(1);
+  process.exitCode = 1;
 });
