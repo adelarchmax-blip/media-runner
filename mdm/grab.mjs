@@ -270,6 +270,112 @@ async function videoBox(page) {
   return best;
 }
 
+// General rule for any site: an item page with no player of its own (no video, no player-sized
+// iframe) often links to a separate watch page. The visible same-site link that names watching
+// (in its address, class or short text) is returned; trailers, downloads and hidden links (traps
+// for robots) never count.
+async function watchPageLink(page) {
+  return page
+    .evaluate(() => {
+      const seen = (e) => {
+        const r = e.getBoundingClientRect();
+        const st = getComputedStyle(e);
+        return r.width >= 16 && r.height >= 12 && st.visibility !== "hidden" && st.display !== "none" && !e.closest("[aria-hidden=true]");
+      };
+      const big = (e) => {
+        const r = e.getBoundingClientRect();
+        return r.width >= 300 && r.height >= 150;
+      };
+      if ([...document.querySelectorAll("video")].some((v) => seen(v) && big(v))) return null;
+      if ([...document.querySelectorAll("iframe")].some((f) => seen(f) && big(f) && f.src && f.src !== "about:blank")) return null;
+      const here = location.href.split("#")[0];
+      const not = /trailer|تريلر|اعلان|إعلان|download|تحميل|تنزيل/i;
+      let pick = null;
+      for (const a of document.querySelectorAll("a[href]")) {
+        if (!seen(a) || a.origin !== location.origin || a.href.split("#")[0] === here) continue;
+        const cls = typeof a.className === "string" ? a.className : "";
+        const text = (a.textContent || "").trim();
+        const byPath = /\/(watch|play|player)(\/|$|\?)/i.test(a.pathname);
+        const byName = /\bwatch\b/i.test(cls) || (text.length <= 25 && /مشاهدة|شاهد الآن|\bwatch( now)?\b/i.test(text));
+        if (!(byPath || byName) || not.test(cls + " " + text + " " + decodeURIComponent(a.pathname))) continue;
+        const score = (byPath ? 2 : 0) + (byName ? 1 : 0);
+        if (!pick || score > pick.score) pick = { href: a.href, score };
+      }
+      return pick && pick.href;
+    })
+    .catch(() => null);
+}
+
+// General rule for any site: a watch page often lists its servers in its code, as other sites'
+// player addresses in its buttons' data attributes (data-link, data-src, data-url, data-embed).
+// The list keeps the page's order, starting with the one already in the player frame.
+async function serverLinks(page) {
+  return page
+    .evaluate(() => {
+      const ok = (u) => {
+        try {
+          const x = new URL(u, location.href);
+          return /^https?:$/.test(x.protocol) && x.origin !== location.origin && !/\.(jpe?g|png|webp|gif|svg|avif|css|js)(\?|$)/i.test(x.pathname) ? x.href : null;
+        } catch {
+          return null;
+        }
+      };
+      const hidden = (e) => !!e.closest("[aria-hidden=true],[hidden]") || getComputedStyle(e).display === "none";
+      const out = [];
+      const frame = [...document.querySelectorAll("iframe")].sort((a, b) => b.offsetWidth * b.offsetHeight - a.offsetWidth * a.offsetHeight)[0];
+      if (frame && ok(frame.src)) out.push(ok(frame.src));
+      for (const a of ["data-link", "data-src", "data-url", "data-embed", "data-iframe"])
+        for (const e of document.querySelectorAll(`[${a}]`)) {
+          const u = !hidden(e) && e.tagName !== "IMG" && e.tagName !== "IFRAME" ? ok(e.getAttribute(a)) : null;
+          if (u && !out.includes(u)) out.push(u);
+        }
+      return out.slice(0, 30);
+    })
+    .catch(() => []);
+}
+
+// The page's biggest player frame loads another server (what the page's own server buttons do).
+async function useServer(page, link) {
+  await page
+    .evaluate((u) => {
+      const f = [...document.querySelectorAll("iframe")].sort((a, b) => b.offsetWidth * b.offsetHeight - a.offsetWidth * a.offsetHeight)[0];
+      if (f) f.src = u;
+    }, link)
+    .catch(() => {});
+}
+
+// Whether the site's robots.txt ("User-agent: *" group) disallows this address's path.
+async function robotsClosed(page, href) {
+  const u = new URL(href);
+  const txt = await page
+    .evaluate((o) => fetch(o + "/robots.txt", { credentials: "omit" }).then((r) => (r.ok ? r.text() : "")), u.origin)
+    .catch(() => "");
+  let mine = false;
+  let grouped = false;
+  const rules = [];
+  for (const raw of txt.split(/\r?\n/)) {
+    const [k, ...rest] = raw.replace(/#.*/, "").split(":");
+    const key = k.trim().toLowerCase();
+    const val = rest.join(":").trim();
+    if (key === "user-agent") {
+      if (grouped) mine = false;
+      grouped = false;
+      if (val === "*") mine = true;
+    } else if (key === "allow" || key === "disallow") {
+      grouped = true;
+      if (mine && val) rules.push([key, val]);
+    }
+  }
+  const p = decodeURIComponent(u.pathname) + u.search;
+  const path = u.pathname + u.search;
+  let best = null;
+  for (const [key, val] of rules) {
+    const re = new RegExp("^" + val.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\\\$$/, "$"));
+    if ((re.test(path) || re.test(p)) && (!best || val.length > best[1].length || (val.length === best[1].length && key === "allow"))) best = [key, val];
+  }
+  return !!best && best[0] === "disallow";
+}
+
 // General rule for any site: a player that shows no <video> yet waits for a click on play.
 // In every frame, the biggest visible play control (by its label, title, class or words);
 // else the centre of the biggest player-like iframe. Returns where it clicked, in the page.
@@ -282,12 +388,15 @@ async function startPlayback(page) {
         const seen = (e) => {
           const r = e.getBoundingClientRect();
           const st = getComputedStyle(e);
-          return r.width >= 16 && r.height >= 16 && st.visibility !== "hidden" && st.display !== "none" && r.bottom > 0 && r.top < innerHeight ? r : null;
+          return r.width >= 16 && r.height >= 16 && st.visibility !== "hidden" && st.display !== "none" && !e.closest("[aria-hidden=true]") && r.bottom > 0 && r.top < innerHeight ? r : null;
         };
         let pick = null;
         for (const e of document.querySelectorAll("button, [role=button], a, div, span, svg")) {
           const label = [e.getAttribute("aria-label"), e.getAttribute("title"), e.getAttribute("data-testid"), typeof e.className === "string" ? e.className : "", e.children.length ? "" : e.textContent].join(" ");
-          if (!words.test(label) || /pause|إيقاف|playlist|player-?settings/i.test(label)) continue;
+          if (!words.test(label) || /pause|إيقاف|playlist|player-?settings|trailer|تريلر|اعلان|إعلان/i.test(label)) continue;
+          // A link to another page (another item, a list) is not this page's play control.
+          const link = e.closest("a[href]");
+          if (link && link.href.split("#")[0] !== location.href.split("#")[0]) continue;
           const r = seen(e);
           if (r && (!pick || r.width * r.height > pick.a)) pick = { x: r.left + r.width / 2, y: r.top + r.height / 2, a: r.width * r.height };
         }
@@ -367,14 +476,35 @@ async function main() {
     const before = new Set((await mdmList()).map((d) => d.id));
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await sleep(3000);
+    const watch = await watchPageLink(page);
+    if (watch) {
+      // The site's own rules for robots (robots.txt, the "*" group) are kept: a watch page it
+      // closes to robots is not opened, and the item fails with that reason.
+      if (await robotsClosed(page, watch)) throw Object.assign(new Error("the site's robots.txt closes its watch pages to robots"), { fatal: true });
+      log("no player on the item's page: its watch page is opened");
+      await page.goto(watch, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    }
     const startUrl = page.url();
     let tried = 0;
+    const servers = await serverLinks(page);
+    if (servers.length) log(`${servers.length} servers listed in the page's code`);
+    let server = 0;
+    let since = Date.now();
     const v = await until(
       "the page's video",
-      90_000,
+      90_000 + 30_000 * Math.min(servers.length, 3),
       async () => {
         const box = await videoBox(page);
         if (box) return box;
+        // No video 30 s after a server came up: the player frame gets the next listed server.
+        if (servers.length > server + 1 && Date.now() - since > 30_000) {
+          server += 1;
+          since = Date.now();
+          await useServer(page, servers[server]);
+          log(`server ${server + 1} of ${servers.length}: ${new URL(servers[server]).hostname}`);
+          return null;
+        }
         if (Date.now() - tried > 6000) {
           tried = Date.now();
           const at = await startPlayback(page);
