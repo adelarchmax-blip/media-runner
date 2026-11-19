@@ -50,7 +50,13 @@ function ipc(cmd) {
     let answer = "";
     s.setTimeout(5000, () => s.destroy(new Error("no answer")));
     s.on("data", (d) => (answer += d));
-    s.on("end", () => resolve(JSON.parse(answer.trim())));
+    s.on("end", () => {
+      try {
+        resolve(JSON.parse(answer.trim()));
+      } catch {
+        resolve({ answer: answer.trim() });
+      }
+    });
     s.on("error", reject);
   });
 }
@@ -252,6 +258,10 @@ async function main() {
     );
     const size = fs.statSync(done.path).size;
     console.log(JSON.stringify({ ok: true, path: done.path, size }));
+  } catch (e) {
+    const page = browser && (await browser.pages().catch(() => []))[1];
+    if (page && process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "failed.png") }).catch(() => {});
+    throw e;
   } finally {
     if (browser) await browser.close().catch(() => {});
     await ipc({ exit: true }).catch(() => {});
