@@ -48,7 +48,7 @@ jobs:
           PAGE_URL: ${{ inputs.url }}
           MDM_SHOTS: ${{ runner.temp }}
         run: |
-          xvfb-run -a node grab.mjs "$PAGE_URL" "$RUNNER_TEMP/out" | tee "$RUNNER_TEMP/grab.log"
+          xvfb-run -a -s "-screen 0 2400x1000x24" node grab.mjs "$PAGE_URL" "$RUNNER_TEMP/out" | tee "$RUNNER_TEMP/grab.log"
           F=$(tail -1 "$RUNNER_TEMP/grab.log" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("path") or sys.exit(d.get("error")))')
           ffprobe -v error -show_entries format=duration,size:stream=codec_name,width,height -of compact "$F"
       - name: Diagnostics

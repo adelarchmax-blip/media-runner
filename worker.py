@@ -97,7 +97,7 @@ def download(item: dict, out_base: str, progress: Progress) -> str:
     """التحميل عبر إضافة Mister Download Manager الرسمية داخل كروم، والبرنامج نفسه ينزّل الملف"""
     out_dir = os.path.dirname(out_base) + "/mdm"
     os.makedirs(out_dir, exist_ok=True)
-    proc = subprocess.Popen(["xvfb-run", "-a", "node", MDM_GRAB, item["watch_url"], out_dir],
+    proc = subprocess.Popen(["xvfb-run", "-a", "-s", "-screen 0 2400x1000x24", "node", MDM_GRAB, item["watch_url"], out_dir],
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     result = {}
     for line in proc.stdout:

@@ -143,6 +143,7 @@ function mdmWindows() {
 // MDM's Download video window (a stream, or a page it has no one-click quality for) waits for
 // its Download button: Enter presses it, as a person would.
 let windowsSeen = "";
+let shotWindow = false;
 function confirmVideoWindow() {
   const wins = mdmWindows();
   const names = wins.map((w) => w.name).join(" | ");
@@ -150,8 +151,15 @@ function confirmVideoWindow() {
   // Any window of MDM's other than its main one ("Mister Download Manager <version>").
   const w = wins.find((x) => !/^Mister Download Manager( [\d.]+)?$/i.test(x.name));
   if (!w) return false;
+  // On the screen (MDM_OFFSCREEN keeps it off), focused, then Enter as typed on the keyboard.
+  spawnSync("xdotool", ["windowmove", w.id, "1300", "0"], { timeout: 5000 });
+  spawnSync("xdotool", ["windowraise", w.id], { timeout: 5000 });
   spawnSync("xdotool", ["windowfocus", "--sync", w.id], { timeout: 5000 });
-  spawnSync("xdotool", ["key", "--window", w.id, "--clearmodifiers", "Return"], { timeout: 5000 });
+  if (process.env.MDM_SHOTS && !shotWindow) {
+    shotWindow = true;
+    spawnSync("import", ["-window", w.id, path.join(process.env.MDM_SHOTS, "mdm-window.png")], { timeout: 10000 });
+  }
+  spawnSync("xdotool", ["key", "--clearmodifiers", "Return"], { timeout: 5000 });
   log(`pressed Enter in "${w.name}"`);
   return true;
 }
