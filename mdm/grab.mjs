@@ -124,7 +124,7 @@ async function buttonState(page) {
     const host = (await frame.$("mdm-video-button").catch(() => null)) || (await frame.$("pierce/mdm-video-button").catch(() => null));
     if (!host) continue;
     try {
-      return await readButton(frame, host);
+      return await readButton(frame);
     } catch (e) {
       const m = String(e.message || e).slice(0, 200);
       if (m !== lastErr) log(`button read: ${(lastErr = m)}`);
@@ -133,30 +133,45 @@ async function buttonState(page) {
   return null;
 }
 
-async function readButton(frame, host) {
-  {
-    const cdp = frame.client;
-    const { node } = await cdp.send("DOM.describeNode", { objectId: host.remoteObject().objectId, pierce: true, depth: 1 });
-    const root = node.shadowRoots && node.shadowRoots[0];
-    if (!root) throw new Error("no shadow root");
-    const { object } = await cdp.send("DOM.resolveNode", { backendNodeId: root.backendNodeId });
-    const { result } = await cdp.send("Runtime.callFunctionOn", {
-      objectId: object.objectId,
-      returnByValue: true,
-      functionDeclaration: `function () {
-        const p = this.querySelector(".pill"), go = this.querySelector(".go");
-        if (!p || !go) return null;
-        const r = go.getBoundingClientRect();
-        return { state: p.dataset.state, label: this.querySelector(".label").textContent,
-                 chip: this.querySelector(".chip").textContent,
-                 x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width };
-      }`,
-    });
-    const v = result.value;
-    if (!v) throw new Error("no pill in the button");
-    const o = await frameOffset(frame);
-    return { ...v, x: v.x + o.x, y: v.y + o.y };
-  }
+// The button's closed shadow tree, read from DevTools' copy of the frame's DOM (attributes and
+// text only, no script inside it): its state, words and where its main part is.
+async function readButton(frame) {
+  const cdp = frame.client;
+  const { root } = await cdp.send("DOM.getDocument", { depth: -1, pierce: true });
+  const find = (n, test) => {
+    if (test(n)) return n;
+    for (const k of [...(n.children || []), ...(n.shadowRoots || []), ...(n.contentDocument ? [n.contentDocument] : [])]) {
+      const f = find(k, test);
+      if (f) return f;
+    }
+    return null;
+  };
+  const attr = (n, name) => {
+    const a = n.attributes || [];
+    for (let i = 0; i < a.length; i += 2) if (a[i] === name) return a[i + 1];
+    return null;
+  };
+  const hasClass = (c) => (n) => n.nodeType === 1 && (attr(n, "class") || "").split(/\s+/).includes(c);
+  const text = (n) => (n.nodeType === 3 ? n.nodeValue : (n.children || []).map(text).join(""));
+  const host = find(root, (n) => n.localName === "mdm-video-button" && n.shadowRoots && n.shadowRoots.length);
+  if (!host) throw new Error("no shadow root");
+  const shadow = host.shadowRoots[0];
+  const pill = find(shadow, hasClass("pill"));
+  const go = pill && find(pill, hasClass("go"));
+  if (!pill || !go) throw new Error("no pill in the button");
+  const { model } = await cdp.send("DOM.getBoxModel", { nodeId: go.nodeId });
+  const q = model.border;
+  const label = find(go, hasClass("label"));
+  const chip = find(go, hasClass("chip"));
+  const o = await frameOffset(frame);
+  return {
+    state: attr(pill, "data-state"),
+    label: label ? text(label).trim() : "",
+    chip: chip ? text(chip).trim() : "",
+    x: (q[0] + q[4]) / 2 + o.x,
+    y: (q[1] + q[5]) / 2 + o.y,
+    w: model.width,
+  };
 }
 
 // Where the extension's button shows, in the page (its host element is ours to measure).
