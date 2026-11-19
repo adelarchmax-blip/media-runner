@@ -133,6 +133,28 @@ async function buttonState(page) {
   return null;
 }
 
+// MDM's own windows on xvfb's screen (xdotool): their ids and titles.
+function mdmWindows() {
+  const ids = spawnSync("xdotool", ["search", "--onlyvisible", "--name", "."], { encoding: "utf8" }).stdout.split("\n").filter(Boolean);
+  return ids
+    .map((id) => ({ id, name: spawnSync("xdotool", ["getwindowname", id], { encoding: "utf8" }).stdout.trim() }))
+    .filter((w) => w.name && !/chrome|chromium/i.test(w.name));
+}
+// MDM's Download video window (a stream, or a page it has no one-click quality for) waits for
+// its Download button: Enter presses it, as a person would.
+let windowsSeen = "";
+function confirmVideoWindow() {
+  const wins = mdmWindows();
+  const names = wins.map((w) => w.name).join(" | ");
+  if (names !== windowsSeen) log(`MDM windows: ${(windowsSeen = names) || "none"}`);
+  const w = wins.find((x) => /video|download/i.test(x.name) && !/^mister download manager$/i.test(x.name));
+  if (!w) return false;
+  spawnSync("xdotool", ["windowfocus", "--sync", w.id], { timeout: 5000 });
+  spawnSync("xdotool", ["key", "--window", w.id, "--clearmodifiers", "Return"], { timeout: 5000 });
+  log(`pressed Enter in "${w.name}"`);
+  return true;
+}
+
 // DevTools' copy of a frame's DOM, closed shadow trees included, with a few readers.
 async function domTree(frame) {
   const { root } = await frame.client.send("DOM.getDocument", { depth: -1, pierce: true });
@@ -375,6 +397,7 @@ async function main() {
     const before = new Set((await mdmList()).map((d) => d.id));
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    const startUrl = page.url();
     let tried = 0;
     const v = await until(
       "the page's video",
@@ -414,15 +437,48 @@ async function main() {
       },
       700,
     );
-    let item = null;
-    for (let attempt = 1; attempt <= 3 && !item; attempt += 1) {
-      await page.mouse.move(v.x + attempt, v.y);
-      await sleep(500);
-      if (!(await downloadBestFromMenu(page).catch((e) => (e.fatal ? Promise.reject(e) : log(`menu: ${e.message}`))))) continue;
-      if (process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "clicked.png") }).catch(() => {});
-      item = await until("the download in MDM's list", 30_000, async () => (await mdmList()).find((d) => !before.has(d.id))).catch(() => null);
-    }
-    if (!item) throw new Error("MDM did not take the video");
+    // The look-up's time, then a click on its main part: the best quality at once, or MDM's
+    // Download video window, confirmed with Enter. Done once MDM's list has the download.
+    await sleep(8000);
+    let clicks = 0;
+    let lastTry = 0;
+    let lastEnter = 0;
+    const item = await until(
+      "MDM to take the video",
+      LOOKUP_MS,
+      async () => {
+        if (page.url() !== startUrl && !page.url().startsWith(startUrl)) {
+          log("the page moved to another video: back to the item's page");
+          await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+          await sleep(4000);
+        }
+        const got = (await mdmList()).find((d) => !before.has(d.id));
+        if (got) return got;
+        if (Date.now() - lastTry > 25_000 && clicks < 4) {
+          const vb = (await videoBox(page)) || v;
+          await page.mouse.move(vb.x + (Date.now() % 3), vb.y);
+          await sleep(400);
+          const st = await buttonState(page);
+          const box = st ? null : await hostBox(page);
+          const at = st ? { x: st.x, y: st.y } : box ? { x: box.x + Math.min(box.width * 0.35, 70), y: box.y + box.height / 2 } : null;
+          if (at) {
+            lastTry = Date.now();
+            clicks += 1;
+            await page.mouse.move(at.x, at.y);
+            await sleep(200);
+            await page.mouse.click(at.x, at.y);
+            log(`clicked the extension's button (${clicks})${st ? `: ${st.state} "${st.label}" "${st.chip}"` : ""}`);
+            if (clicks === 1 && process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "clicked.png") }).catch(() => {});
+          }
+        }
+        if (clicks && Date.now() - lastEnter > 6000) {
+          lastEnter = Date.now();
+          confirmVideoWindow();
+        }
+        return null;
+      },
+      1000,
+    );
     log(`MDM took it (#${item.id})`);
     let last = "";
     const done = await until(
