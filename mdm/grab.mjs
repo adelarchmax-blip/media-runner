@@ -465,9 +465,12 @@ async function main() {
         const got = (await mdmList()).find((d) => !before.has(d.id));
         if (got) return got;
         if (Date.now() - lastTry > 25_000 && clicks < 4) {
+          // The button shows while the pointer moves over the video (and fades 1.5 s after it rests).
           const vb = (await videoBox(page)) || v;
-          await page.mouse.move(vb.x + (Date.now() % 3), vb.y);
-          await sleep(400);
+          for (const dx of [-12, 6, 0]) {
+            await page.mouse.move(vb.x + dx, vb.y + dx / 2, { steps: 4 });
+            await sleep(150);
+          }
           // Where it shows on the screen: its main part is its left side ("Download video").
           const st = await buttonState(page);
           const box = await hostBox(page);
