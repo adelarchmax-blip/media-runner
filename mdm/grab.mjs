@@ -102,38 +102,66 @@ function registerHost(profile) {
   fs.copyFileSync(manifest, path.join(profile, "NativeMessagingHosts", `${HOST}.json`));
 }
 
-// The extension's button lives in a closed shadow root: DevTools reaches it, page scripts can't.
-async function buttonState(page, cdp) {
-  const host = await page.$("mdm-video-button");
-  if (!host) return null;
-  const { node } = await cdp.send("DOM.describeNode", { objectId: host.remoteObject().objectId, pierce: true, depth: 1 });
-  const root = node.shadowRoots && node.shadowRoots[0];
-  if (!root) return null;
-  const { object } = await cdp.send("DOM.resolveNode", { backendNodeId: root.backendNodeId });
-  const { result } = await cdp.send("Runtime.callFunctionOn", {
-    objectId: object.objectId,
-    returnByValue: true,
-    functionDeclaration: `function () {
-      const p = this.querySelector(".pill"), go = this.querySelector(".go");
-      if (!p || !go) return null;
-      const r = go.getBoundingClientRect();
-      return { state: p.dataset.state, label: this.querySelector(".label").textContent,
-               chip: this.querySelector(".chip").textContent,
-               x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width };
-    }`,
-  });
-  return result.value;
+// Where a frame's top-left sits in the page (players often live in an iframe).
+async function frameOffset(frame) {
+  const el = frame.parentFrame() ? await frame.frameElement() : null;
+  const box = el ? await el.boundingBox() : null;
+  return box ? { x: box.x, y: box.y } : { x: 0, y: 0 };
 }
 
+// The extension's button lives in a closed shadow root: DevTools reaches it, page scripts can't.
+// Searched in every frame; coordinates come back in the page's viewport.
+async function buttonState(page) {
+  for (const frame of page.frames()) {
+    const host = await frame.$("mdm-video-button").catch(() => null);
+    if (!host) continue;
+    const cdp = frame.client;
+    const { node } = await cdp.send("DOM.describeNode", { objectId: host.remoteObject().objectId, pierce: true, depth: 1 });
+    const root = node.shadowRoots && node.shadowRoots[0];
+    if (!root) continue;
+    const { object } = await cdp.send("DOM.resolveNode", { backendNodeId: root.backendNodeId });
+    const { result } = await cdp.send("Runtime.callFunctionOn", {
+      objectId: object.objectId,
+      returnByValue: true,
+      functionDeclaration: `function () {
+        const p = this.querySelector(".pill"), go = this.querySelector(".go");
+        if (!p || !go) return null;
+        const r = go.getBoundingClientRect();
+        return { state: p.dataset.state, label: this.querySelector(".label").textContent,
+                 chip: this.querySelector(".chip").textContent,
+                 x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width };
+      }`,
+    });
+    const v = result.value;
+    if (!v) continue;
+    const o = await frameOffset(frame);
+    return { ...v, x: v.x + o.x, y: v.y + o.y };
+  }
+  return null;
+}
+
+// The biggest visible video in any frame, its centre in the page's viewport.
 async function videoBox(page) {
-  return page.evaluate(() => {
-    const v = [...document.querySelectorAll("video")].find((e) => e.getBoundingClientRect().width > 150);
-    if (!v) return null;
-    v.muted = true;
-    v.play().catch(() => {});
-    const r = v.getBoundingClientRect();
-    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-  });
+  let best = null;
+  for (const frame of page.frames()) {
+    const r = await frame
+      .evaluate(() => {
+        const vs = [...document.querySelectorAll("video")]
+          .map((e) => [e, e.getBoundingClientRect()])
+          .filter(([, r]) => r.width >= 200 && r.height >= 112)
+          .sort((a, b) => b[1].width * b[1].height - a[1].width * a[1].height);
+        if (!vs.length) return null;
+        const [v, r] = vs[0];
+        v.muted = true;
+        v.play().catch(() => {});
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2, area: r.width * r.height };
+      })
+      .catch(() => null);
+    if (!r || (best && best.area >= r.area)) continue;
+    const o = await frameOffset(frame);
+    best = { x: r.x + o.x, y: r.y + o.y, area: r.area };
+  }
+  return best;
 }
 
 async function main() {
@@ -168,11 +196,11 @@ async function main() {
 
     const before = new Set((await mdmList()).map((d) => d.id));
     const page = await browser.newPage();
-    const cdp = await page.createCDPSession();
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
     const v = await until("the page's video", 60_000, () => videoBox(page));
     log("video on the page");
     let lastSeen = "";
+    let lastClick = Date.now();
     if (process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "page.png") }).catch(() => {});
 
     // The pointer over the video brings the button; it looks the video up, then names the best
@@ -181,8 +209,13 @@ async function main() {
       "the extension's button to be ready",
       LOOKUP_MS,
       async () => {
+        // A player that waits for its play button: one real click on the video every 15 s.
+        if (Date.now() - lastClick > 15_000) {
+          lastClick = Date.now();
+          await page.mouse.click(v.x, v.y);
+        }
         await page.mouse.move(v.x + (Date.now() % 3), v.y);
-        const s = await buttonState(page, cdp);
+        const s = await buttonState(page);
         const seen = s ? `${s.state} "${s.label}" "${s.chip}"` : "no button";
         if (seen !== lastSeen) log(`button: ${(lastSeen = seen)}`);
         if (s && ["err", "drm", "off"].includes(s.state)) throw Object.assign(new Error(`button: ${s.state} ${s.label}`), { fatal: true });
@@ -193,7 +226,7 @@ async function main() {
     log(`button ready: ${ready.chip}`);
     await page.mouse.move(ready.x, ready.y);
     await sleep(150);
-    const now = (await buttonState(page, cdp)) || ready;
+    const now = (await buttonState(page)) || ready;
     await page.mouse.click(now.x, now.y);
     log("clicked");
 
