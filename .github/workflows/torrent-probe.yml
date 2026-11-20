@@ -52,69 +52,58 @@ jobs:
         run: df -h / "$RUNNER_TEMP" | tail -n +1
       - name: Install Mister Download Manager
         run: bash mdm/setup.sh
-      - name: Torrent through MDM
+      - name: Torrent through the runner's own download path
         env:
           SOURCES: ${{ inputs.source }}
           MINUTES: ${{ inputs.minutes }}
+          # worker.py needs these to load; the probe reports to no one and uploads nothing
+          RUNNER_API_URL: http://127.0.0.1:9
+          RUNNER_API_TOKEN: none
+          RCLONE_REMOTE: none
+          MEDIA_BASE_PATH: none
         run: |
           set -o pipefail
-          CLI=misterdownloadmanager-cli
-          export MDM_DATA_DIR="$HOME/mdm/data"
-          N=0; OKS=0
-          set -f        # the addresses hold "?": no file-name expansion
-          for SOURCE in $SOURCES; do
-          N=$((N+1)); echo "=================== torrent $N"
-          W="$RUNNER_TEMP/torrent$N"; mkdir -p "$W/out"
-          SRC="$SOURCE"
-          case "$SOURCE" in http*)
-            curl -fsSL --max-filesize 5000000 -o "$W/source.torrent" -- "$SOURCE" || { echo "RESULT the .torrent file did not download"; continue; }
-            SRC="$W/source.torrent";;
-          esac
-          timeout 300 $CLI --json torrent-info "$SRC" > "$W/info.json" || { echo "RESULT no file list (dead?)"; continue; }
-          # The film: the largest video file, never a sample or trailer; mp4/mkv preferred.
-          PICK=$(python3 - "$W/info.json" <<'EOF'
-          import json, re, sys
-          info = json.load(open(sys.argv[1]))
-          print(f"TORRENT {info['name']} | {info['size']/1048576:.0f} MB | {len(info['files'])} files", file=sys.stderr)
-          vids = [f for f in info["files"] if re.search(r"\.(mp4|mkv|avi|m4v|webm|mov|mpe?g|ts)$", f["path"], re.I)
-                  and not re.search(r"\b(sample|trailer|teaser)\b", f["path"], re.I)]
-          for f in info["files"]:
-              print(f"  {f['index']:>3} {f['size']/1048576:>8.1f} MB  {f['path']}", file=sys.stderr)
-          if not vids:
-              sys.exit("no video file in the torrent")
-          best = max(vids, key=lambda f: (f["path"].lower().endswith((".mp4", ".mkv")), f["size"]))
-          subs = [f["index"] for f in info["files"] if re.search(r"\.(srt|ass|ssa|vtt|sub)$", f["path"], re.I)]
-          print(",".join(map(str, [best["index"], *subs])))
-          print(f"PICKED {best['path']} + {len(subs)} subtitle file(s)", file=sys.stderr)
+          python3 - <<'EOF'
+          import hashlib, logging, os, shutil, subprocess, sys, time
+          import requests
+          sys.path.insert(0, os.getcwd())
+          import worker
+          worker.api = lambda *a, **k: {}          # no controller here
+          logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+          minutes, oks, items = int(os.environ["MINUTES"]), 0, os.environ["SOURCES"].split()
+          for n, src in enumerate(items, 1):
+              print(f"=================== torrent {n}", flush=True)
+              job = os.path.join(os.environ["RUNNER_TEMP"], f"torrent{n}")
+              os.makedirs(job, exist_ok=True)
+              try:
+                  if src.startswith("magnet:"):
+                      item = {"id": n, "watch_url": src}
+                  else:                            # the magnet is built from the file's own hash
+                      with requests.get(src, headers=worker._BROWSER_UA, timeout=30, stream=True) as r:
+                          r.raise_for_status()
+                          data = r.raw.read(worker.MAX_TORRENT_FILE + 1, decode_content=True)
+                      if len(data) > worker.MAX_TORRENT_FILE:
+                          raise RuntimeError("the .torrent file is too big")
+                      _, (a, b) = worker._bdecode(data)
+                      item = {"id": n, "torrent_url": src,
+                              "watch_url": "magnet:?xt=urn:btih:" + hashlib.sha1(data[a:b]).hexdigest()}
+                  worker.START, worker.MAX_SECONDS = time.time(), (minutes + 15) * 60 + 30
+                  start = time.time()
+                  path, subs = worker.download_torrent(item, os.path.join(job, "film"), worker.Progress(n))
+                  secs, size = max(time.time() - start, 1), os.path.getsize(path)
+                  print(f"RESULT done in {secs:.0f}s | {size / 1048576:.0f} MB | avg {size / 1048576 / secs:.1f} MB/s | {len(subs)} subtitle(s)")
+                  subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration,size:stream=codec_type,codec_name,width,height",
+                                  "-of", "compact", path], check=False)
+                  oks += 1
+              except Exception as e:
+                  print(f"RESULT failed: {worker._URL.sub('<address>', str(e))[:200]}")
+              finally:
+                  worker.free_disk(n)
+                  shutil.rmtree(job, ignore_errors=True)
+          print("--- MDM processes left (should be none, no seeding):", flush=True)
+          if subprocess.run(["pgrep", "-af", "-i", "misterdownload"]).returncode:
+              print("(none)")
+          print(f"SUMMARY {oks} of {len(items)} downloaded and checked")
+          sys.exit(0 if oks else 1)
           EOF
-          ) || { echo "RESULT no video file in it"; continue; }
-          start=$(date +%s)
-          timeout $((MINUTES*60)) $CLI --json torrent-get "$SRC" -o "$W/out" --files "$PICK" > "$W/get.jsonl" || echo "torrent-get stopped: $?"
-          end=$(date +%s)
-          python3 - "$W/get.jsonl" $((end-start)) <<'EOF'
-          import json, sys
-          rows = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
-          prog = [r for r in rows if r.get("event") == "progress"]
-          peers = max((r.get("peers") or 0 for r in prog), default=0)
-          seen = max((r.get("peers_seen") or 0 for r in prog), default=0)
-          top = max((r.get("speed") or 0 for r in prog), default=0)
-          for r in prog[:: max(1, len(prog) // 12)]:
-              print(f"  {r.get('phase')} {(r.get('downloaded') or 0)/1048576:.0f}/{(r.get('size') or 0)/1048576:.0f} MB  {(r.get('speed') or 0)/1048576:.1f} MB/s  peers {r.get('peers')}")
-          done = [r for r in rows if r.get("event") == "done"]
-          secs = int(sys.argv[2])
-          print(f"RESULT {'done' if done else 'not done'} in {secs}s | top speed {top/1048576:.1f} MB/s | peers max {peers}, seen {seen}")
-          if done:
-              d = done[-1]; print(f"PATH {d['path']} | {d['size']/1048576:.0f} MB | avg {d['size']/1048576/max(secs,1):.1f} MB/s")
-          errs = [r for r in rows if "error" in r]
-          if errs: print("ERROR", errs[-1])
-          EOF
-          echo "--- files on disk:"; find "$W/out" -type f -printf '%s %p\n' | sort -rn | head
-          F=$(find "$W/out" -type f -regextype posix-extended -iregex '.*\.(mp4|mkv|avi|m4v|webm|mov|mpe?g|ts)$' -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
-          [ -n "$F" ] && { ffprobe -v error -show_entries format=duration,size:stream=codec_type,codec_name,width,height -of compact "$F" || true; }
-          [ -n "$F" ] && OKS=$((OKS+1))
-          rm -rf "$W"
-          done
-          echo "--- MDM processes left (should be none, no seeding):"; pgrep -af -i misterdownload || echo "(none)"
           echo "--- disk after:"; df -h / "$RUNNER_TEMP"
-          echo "SUMMARY $OKS of $N downloaded and checked"
-          [ "$OKS" -gt 0 ]
