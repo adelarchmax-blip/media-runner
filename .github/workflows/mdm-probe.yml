@@ -20,6 +20,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - name: Hide the page addresses
+        run: |
+          # The repository is public: every page address and its site name are masked in the log
+          # before any step shows them. Read from the event file, so this step prints none of them.
+          set -f
+          for u in $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("inputs",{}).get("url",""))' "$GITHUB_EVENT_PATH"); do
+            echo "::add-mask::$u"
+            h=$(python3 -c 'import sys,urllib.parse as p; print(p.urlsplit(sys.argv[1]).hostname or "")' "$u")
+            b=${h#www.}; n=${b%%.*}
+            if [ -n "$b" ]; then echo "::add-mask::$h"; echo "::add-mask::$b"; fi
+            if [ ${#n} -ge 4 ]; then echo "::add-mask::$n"; fi
+          done
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
