@@ -332,7 +332,29 @@ async function serverLinks(page) {
         }
       return out.slice(0, 30);
     })
+    .then(byHostInTurn)
     .catch(() => []);
+}
+
+// Servers of one host often fail together (the host blocks the runner or refuses to be framed),
+// so the hosts take turns: the first of each host in page order, then the second of each, ...
+// The page's own first server stays first.
+function byHostInTurn(links) {
+  const hosts = new Map();
+  for (const u of links) {
+    const h = new URL(u).hostname.replace(/^www\./, "");
+    if (!hosts.has(h)) hosts.set(h, []);
+    hosts.get(h).push(u);
+  }
+  const out = [];
+  for (let i = 0; out.length < links.length; i++) for (const list of hosts.values()) if (list[i]) out.push(list[i]);
+  return out;
+}
+
+// The player frame shows the browser's own error page (the server refused to be framed or to
+// connect): nothing will play there.
+function playerRefused(page) {
+  return page.frames().some((f) => f.parentFrame() && f.url().startsWith("chrome-error://"));
 }
 
 // The page's biggest player frame loads another server (what the page's own server buttons do).
@@ -542,8 +564,10 @@ async function main() {
         }
         const box = await videoBox(page);
         if (box) return box;
-        // No video 30 s after a server came up: the player frame gets the next listed server.
-        if (servers.length > server + 1 && Date.now() - since > 30_000) {
+        // No video 30 s after a server came up (5 s when it refused): the next listed server.
+        const refused = playerRefused(page);
+        if (servers.length > server + 1 && Date.now() - since > (refused ? 5_000 : 30_000)) {
+          if (refused) log(`server ${server + 1} refused to open in the page`);
           server += 1;
           since = Date.now();
           await useServer(page, servers[server]);
