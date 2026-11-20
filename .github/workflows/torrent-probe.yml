@@ -45,6 +45,12 @@ jobs:
           if not 1 <= len(items) <= 6 or not all(ok(s) for s in items) or not re.fullmatch(r"[1-9][0-9]?", m):
               sys.exit("source: 1-6 magnet links or .torrent addresses; minutes 1-99")
           EOF
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install the runner's Python libraries
+        run: pip install -q -r requirements.txt
       - name: Install ffprobe
         run: |
           command -v ffprobe >/dev/null || { sudo rm -f /var/lib/man-db/auto-update; sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null; }; }
