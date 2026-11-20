@@ -10,16 +10,25 @@ import requests
 def call(base: str, token: str, path: str, payload: dict, timeout: float = 30, tries: int = 3,
          wait: float = 5) -> dict:
     """POSTs `payload` to n8n; a lost answer is sent again (the controller treats repeats as one).
-    Returns {} when n8n never answered."""
+    Returns the answer, or {} when n8n refused or never answered (said in the log, so a changed n8n shows)."""
+    why = "no answer"
     for attempt in range(tries):
         try:
             r = requests.post(f"{base}/{path}", json=payload, timeout=timeout, headers={"X-Runner-Token": token})
-            if r.status_code < 500:
-                return r.json() if r.content else {}
-        except (requests.RequestException, ValueError):
-            pass
+            if r.status_code < 300:
+                data = r.json() if r.content else {}
+                return data if isinstance(data, dict) else {}
+            if r.status_code < 500:                       # missing route or refused: sending again will not help
+                logging.warning(f"n8n refused {path} ({r.status_code}): is the workflow imported and active?")
+                return {}
+            why = f"error {r.status_code}"
+        except requests.RequestException as e:
+            why = type(e).__name__
+        except ValueError:
+            why = "answer not understood"
         if attempt + 1 < tries:
             time.sleep(wait * (attempt + 1))
+    logging.warning(f"n8n gave no usable answer to {path} after {tries} tries ({why})")
     return {}
 
 
