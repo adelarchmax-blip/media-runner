@@ -352,48 +352,57 @@ def _find(root: str, name, rel: str):
 
 
 MAX_TORRENT_FILE = 2 * 1048576
+_BROWSER_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36"}
 SESSIONS_FILE = os.path.join(os.environ.get("RUNNER_TEMP") or "/tmp", "miinspact-sessions.json")
 
 
-def _info_span(data: bytes):
-    """Where the `info` dictionary sits inside a .torrent (its SHA-1 is the torrent's hash). Strict and bounded."""
-    pos = [0]
+def _bdecode(data: bytes):
+    """A .torrent's contents (bencode) as Python values, plus where its `info` dictionary sits (that
+    part's SHA-1 is the torrent's hash). Strict and bounded: a broken file raises ValueError."""
+    pos, span = 0, [None]
 
-    def skip(depth=0):
-        if depth > 64 or pos[0] >= len(data):
+    def val(depth):
+        nonlocal pos
+        if depth > 64 or pos >= len(data):
             raise ValueError("bad torrent")
-        c = data[pos[0]:pos[0] + 1]
+        c = data[pos:pos + 1]
         if c == b"i":
-            end = data.index(b"e", pos[0])
-            pos[0] = end + 1
-        elif c in (b"l", b"d"):
-            is_dict = c == b"d"
-            pos[0] += 1
-            found = None
-            while data[pos[0]:pos[0] + 1] != b"e":
-                key_start = pos[0]
-                skip(depth + 1)
-                if is_dict:
-                    key = data[key_start:pos[0]]
-                    start = pos[0]
-                    skip(depth + 1)
-                    if depth == 0 and key == b"4:info":
-                        found = (start, pos[0])
-            pos[0] += 1
-            return found
-        elif c.isdigit():
-            colon = data.index(b":", pos[0])
-            length = int(data[pos[0]:colon])
+            end = data.index(b"e", pos)
+            num = int(data[pos + 1:end])
+            pos = end + 1
+            return num
+        if c == b"l":
+            pos += 1
+            items = []
+            while data[pos:pos + 1] != b"e":
+                items.append(val(depth + 1))
+            pos += 1
+            return items
+        if c == b"d":
+            pos += 1
+            items = {}
+            while data[pos:pos + 1] != b"e":
+                key = val(depth + 1)
+                if not isinstance(key, bytes):
+                    raise ValueError("bad torrent")
+                start = pos
+                items[key] = val(depth + 1)
+                if depth == 0 and key == b"info":
+                    span[0] = (start, pos)
+            pos += 1
+            return items
+        if c.isdigit():
+            colon = data.index(b":", pos)
+            length = int(data[pos:colon])
             if length < 0 or colon + 1 + length > len(data):
                 raise ValueError("bad torrent")
-            pos[0] = colon + 1 + length
-        else:
-            raise ValueError("bad torrent")
-        return None
-    span = skip()
-    if not span:
+            pos = colon + 1 + length
+            return data[colon + 1:pos]
+        raise ValueError("bad torrent")
+    value = val(0)
+    if not isinstance(value, dict) or not span[0] or not isinstance(value.get(b"info"), dict):
         raise ValueError("no info in torrent")
-    return span
+    return value, span[0]
 
 
 def _session_cookie(url: str) -> str:
@@ -421,7 +430,7 @@ def torrent_source(item: dict, job_dir: str, link: str) -> str:
     if not re.match(r"^https?://[^\s\"'<>\\]+$", url) or len(url) > 2000:
         return link
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36"}
+        headers = dict(_BROWSER_UA)
         cookie = _session_cookie(url)
         if cookie:
             headers["Cookie"] = cookie
@@ -432,7 +441,7 @@ def torrent_source(item: dict, job_dir: str, link: str) -> str:
                 data += chunk
                 if len(data) > MAX_TORRENT_FILE:
                     raise ValueError("torrent file too big")
-        a, b = _info_span(data)
+        _, (a, b) = _bdecode(data)
         want = re.search(r"btih:([0-9a-fA-F]{40})", link)
         if not want or hashlib.sha1(data[a:b]).hexdigest() != want.group(1).lower():
             raise ValueError("torrent file is not the same torrent")
@@ -446,9 +455,176 @@ def torrent_source(item: dict, job_dir: str, link: str) -> str:
         return link
 
 
+WEBSEED_TRIES = 4              # عناوين مباشرة تتجرّب لكل ملف قبل الرجوع للتورنت العادي
+_SHA1_HEX = re.compile(r"[0-9a-fA-F]{40}")
+_SAFE_EXT = re.compile(r"\.[A-Za-z0-9]{1,5}")
+
+
+def web_sources(source: str, link: str) -> dict:
+    """The torrent's direct web sources (BEP 19: the .torrent's `url-list`, or the magnet's `ws=`),
+    whether it holds a folder of files, and each file's SHA-1 when the .torrent lists it."""
+    from urllib.parse import parse_qs
+    urls, multi, sha1 = parse_qs(link[8:]).get("ws", []), None, {}
+    if os.path.isfile(source):
+        try:
+            with open(source, "rb") as fh:
+                top, _ = _bdecode(fh.read())
+        except (OSError, ValueError):
+            return {"urls": [], "multi": None, "sha1": {}}
+        found = top.get(b"url-list")
+        found = [found] if isinstance(found, bytes) else found if isinstance(found, list) else []
+        urls = [u.decode("utf-8", "replace") for u in found if isinstance(u, bytes)] + urls
+        info = top[b"info"]
+        files = info.get(b"files")
+        multi = isinstance(files, list)
+        name = info.get(b"name", b"").decode("utf-8", "replace")
+        entries = [(f.get(b"path"), f.get(b"sha1")) for f in files if isinstance(f, dict)] if multi \
+            else [([name.encode()], info.get(b"sha1"))]
+        for parts, digest in entries:
+            if isinstance(parts, list) and all(isinstance(x, bytes) for x in parts) and \
+                    isinstance(digest, bytes) and _SHA1_HEX.fullmatch(digest.decode("ascii", "replace")):
+                sha1["/".join(x.decode("utf-8", "replace") for x in parts)] = digest.decode().lower()
+    return {"urls": list(dict.fromkeys(u for u in urls if isinstance(u, str)))[:20], "multi": multi, "sha1": sha1}
+
+
+def webseed_urls(seeds: list, name: str, rel: str, multi) -> list:
+    """Where each web source keeps one file of the torrent (BEP 19): a folder torrent's file sits at
+    <source>/<torrent name>/<path>; a one-file torrent's at <source><name> or at the source itself."""
+    from urllib.parse import quote
+    out = []
+    for s in seeds:
+        if multi:
+            out.append(s.rstrip("/") + "/" + quote(name, safe="") + "/" + quote(rel, safe="/"))
+        else:
+            out.append(s + quote(name, safe="") if s.endswith("/") else s)
+    return list(dict.fromkeys(out))
+
+
+def _public_web(url: str) -> bool:
+    """A plain http(s) address whose host is on the public internet only (no local or private network)."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+    if not isinstance(url, str) or len(url) > 2000 or re.search(r"[\s\"'<>\\]", url):
+        return False
+    try:
+        u = urlsplit(url)
+        port = u.port
+        if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password:
+            return False
+        addrs = {a[4][0] for a in socket.getaddrinfo(u.hostname, port or 443, proto=socket.IPPROTO_TCP)}
+        return bool(addrs) and all(ipaddress.ip_address(a.split("%")[0]).is_global for a in addrs)
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def _probe(url: str, size: int) -> str:
+    """The final address of a working copy of the file (answers, same size), else ''. Every redirect
+    is checked to stay on the public internet before it is followed."""
+    for _ in range(6):
+        if not _public_web(url):
+            return ""
+        try:
+            with requests.get(url, headers=_BROWSER_UA, timeout=20, stream=True, allow_redirects=False) as r:
+                if r.is_redirect:
+                    from urllib.parse import urljoin
+                    url = urljoin(url, r.headers.get("Location", ""))
+                    continue
+                length = r.headers.get("Content-Length")
+                ok = r.status_code == 200 and (not length or int(length) == size)
+                return url if ok else ""
+        except (requests.RequestException, ValueError):
+            return ""
+    return ""
+
+
+def _run_mdm(cmd: list, env: dict, progress: Progress, deadline: float, total: int = 0) -> tuple:
+    """Runs one MDM download command and reads its JSON lines into the progress bar. It is stopped
+    when nothing moves for TORRENT_STALL or the run's time is up. Returns (end message, bytes seen,
+    most peers, why it was stopped or '')."""
+    proc = _start_group(cmd, env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    progress.procs.append(proc)
+    state = {"moved": time.time(), "why": ""}
+    finished = threading.Event()
+
+    def watchdog():
+        while not finished.wait(TORRENT_CHECK):
+            now = time.time()
+            if now - state["moved"] > TORRENT_STALL or now > deadline:
+                state["why"] = "stalled" if now <= deadline else "time"
+                _stop_group(proc)
+                return
+    threading.Thread(target=watchdog, daemon=True).start()
+    seen, peers, end = -1, 0, {}
+    try:
+        for line in proc.stdout:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("event") == "progress":
+                got, size = msg.get("downloaded") or 0, msg.get("size") or total
+                if got > seen:
+                    seen, state["moved"] = got, time.time()
+                peers = max(peers, msg.get("peers") or 0)
+                progress.dl_pct = min(100, int(got * 100 / size)) if size else 0
+                progress.speed = (msg.get("speed") or 0) / 1048576
+                progress.size_mb = size / 1048576
+                progress.push()
+            elif msg.get("event") in ("done", "paused", "stopped") or "error" in msg:
+                end = msg
+        proc.wait()
+    finally:
+        finished.set()
+        _stop_group(proc)
+        progress.procs.remove(proc)
+        proc.stdout.close()
+    progress.check()
+    return end, seen, peers, state["why"]
+
+
+def _why(end: dict) -> str:
+    return _URL.sub("<address>", str(end.get("error") or end.get("event") or "stopped"))[:150]
+
+
+def fetch_direct(files: list, web: dict, name: str, out_dir: str, env: dict, progress: Progress, deadline: float) -> dict:
+    """Downloads the picked files from the torrent's direct web sources with MDM's ordinary download
+    (no peer needed), checked by size and by SHA-1 when the .torrent gives it.
+    Returns {path inside the torrent: local file}; a file no source gives is left out."""
+    got = {}
+    folder = os.path.join(out_dir, "direct")
+    os.makedirs(folder, exist_ok=True)
+    for f in files:
+        ext = os.path.splitext(f["path"])[1]
+        dst = os.path.join(folder, f"{f['index']}{ext.lower() if _SAFE_EXT.fullmatch(ext) else ''}")
+        for url in webseed_urls(web["urls"], name, f["path"], web["multi"])[:WEBSEED_TRIES]:
+            final = _probe(url, f["size"])
+            if not final:
+                continue
+            # The address was checked public just now; MDM looks the name up again itself (a host that
+            # changes its answer in between could point elsewhere: the runner holds no private network).
+            cmd = [MDM_CLI, "--json", "get", final, "-o", dst, "--direct"]
+            if web["sha1"].get(f["path"]):
+                cmd += ["--checksum", "sha1:" + web["sha1"][f["path"]]]
+            end, _, _, why = _run_mdm(cmd, env, progress, deadline, f["size"])
+            if end.get("event") == "done" and os.path.isfile(dst) and os.path.getsize(dst) == f["size"]:
+                got[f["path"]] = dst
+                break
+            logging.info(f"  torrent: a direct source failed ({why or _why(end)})")
+            for left in (dst, dst + ".mdm.part", dst + ".mdm.json"):     # the next source starts clean
+                if os.path.isfile(left):
+                    os.remove(left)
+            if why == "time":
+                return got
+    return got
+
+
 def download_torrent(item: dict, out_base: str, progress: Progress) -> tuple:
-    """تحميل تورنت بمحرك Mister Download Manager نفسه: الفيلم + ملفات الترجمة بس، ومن غير مشاركة
-    بعد الانتهاء. بيرجّع (مسار الفيديو، [(مسار ترجمة، اسمها في المكتبة)])."""
+    """تحميل تورنت ببرنامج Mister Download Manager: الفيلم + ملفات الترجمة بس، ومن غير مشاركة بعد
+    الانتهاء. لو التورنت معاه مصادر مباشرة على الويب، الملف بيتحمّل منها الأول بالتحميل العادي،
+    ولو منفعتش يرجع لمحرك التورنت. بيرجّع (مسار الفيديو، [(مسار ترجمة، اسمها في المكتبة)])."""
     link = check_magnet(item.get("watch_url"))
     job_dir = os.path.dirname(out_base)
     out_dir = os.path.join(job_dir, "torrent")
@@ -475,71 +651,42 @@ def download_torrent(item: dict, out_base: str, progress: Progress) -> tuple:
         why = str(meta.get("error") or "no answer") if isinstance(meta, dict) else "bad answer"
         raise RuntimeError(f"{DEAD}: no file list ({_URL.sub('<address>', why)[:150]})")
     best, subs = pick_files(meta["files"])
+    name = meta.get("name") if isinstance(meta.get("name"), str) else ""
     logging.info(f"  torrent: {len(meta['files'])} file(s), film {best['size'] / 1048576:.0f} MB + {len(subs)} subtitle(s)")
     budget = int(MAX_SECONDS - (time.time() - START) - 15 * 60)   # يفضل وقت للتحقق والرفع
     if budget < 10 * 60:
         raise RuntimeError("no time left for this torrent in this run")
+    deadline = time.time() + budget
     progress.stage = "item_download"
     hold_disk(int(item["id"]), best["size"] * 2 + sum(f["size"] for f in subs))   # the film + its moved copy
-    wanted = ",".join(str(f["index"]) for f in [best, *subs])
-    proc = _start_group([MDM_CLI, "--json", "torrent-get", source, "-o", out_dir, "--files", wanted,
-                         "--seconds", str(budget)], env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    progress.procs.append(proc)
-    state = {"moved": time.time(), "stalled": False}
-    finished = threading.Event()
-
-    def watchdog():
-        while not finished.wait(TORRENT_CHECK):
-            if time.time() - state["moved"] > TORRENT_STALL:
-                state["stalled"] = True
-                _stop_group(proc)
-                return
-    threading.Thread(target=watchdog, daemon=True).start()
-    seen, peers, end = -1, 0, {}
-    try:
-        for line in proc.stdout:
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("event") == "progress":
-                got, size = msg.get("downloaded") or 0, msg.get("size") or 0
-                if got > seen:
-                    seen, state["moved"] = got, time.time()
-                peers = max(peers, msg.get("peers") or 0)
-                progress.dl_pct = min(100, int(got * 100 / size)) if size else 0
-                progress.speed = (msg.get("speed") or 0) / 1048576
-                progress.size_mb = size / 1048576
-                progress.push()
-            elif msg.get("event") in ("done", "paused", "stopped") or "error" in msg:
-                end = msg
-        proc.wait()
-    finally:
-        finished.set()
-        _stop_group(proc)
-        progress.procs.remove(proc)
-        proc.stdout.close()
-    progress.check()
-    if end.get("event") != "done":
-        if state["stalled"] and seen <= 0:      # not one byte from anybody: dead from the start
-            raise RuntimeError(f"{DEAD}: nobody sent any part of it | peers max {peers}")
-        why = "no one is sharing it (stalled)" if state["stalled"] else \
-            _URL.sub("<address>", str(end.get("error") or end.get("event") or "stopped"))[:150]
-        raise RuntimeError(f"torrent: {why} | peers max {peers}")
-    name = meta.get("name")
-    src = _find(out_dir, name, best["path"])
-    if not src:
-        raise RuntimeError("torrent: the film's file is missing after the download")
+    web = web_sources(source, link)
+    if web["multi"] is None:     # magnet only: one file named like the torrent = a one-file torrent
+        web["multi"] = not (len(meta["files"]) == 1 and best["path"] == name)
+    direct = fetch_direct([best, *subs], web, name, out_dir, env, progress, deadline) if web["urls"] and name else {}
+    if best["path"] in direct:
+        logging.info("  torrent: the film came from its direct web source")
+        src = direct[best["path"]]
+        found = [(direct[f["path"]], f["path"]) for f in subs if f["path"] in direct]
+    else:
+        wanted = ",".join(str(f["index"]) for f in [best, *subs])
+        left = int(deadline - time.time())
+        if left < 5 * 60:
+            raise RuntimeError("no time left for this torrent in this run")
+        end, seen, peers, why = _run_mdm([MDM_CLI, "--json", "torrent-get", source, "-o", out_dir, "--files", wanted,
+                                          "--seconds", str(left)], env, progress, deadline + 60)
+        if end.get("event") != "done":
+            if why and seen <= 0:      # not one byte from anybody: dead from the start
+                raise RuntimeError(f"{DEAD}: nobody sent any part of it | peers max {peers}")
+            reason = "no one is sharing it (stalled)" if why else _why(end)
+            raise RuntimeError(f"torrent: {reason} | peers max {peers}")
+        src = _find(out_dir, name, best["path"])
+        if not src:
+            raise RuntimeError("torrent: the film's file is missing after the download")
+        found = [(p, f["path"]) for f in subs for p in [_find(out_dir, name, f["path"])] if p]
     progress.size_mb = os.path.getsize(src) / 1048576
     dst = out_base + os.path.splitext(src)[1].lower()
     shutil.move(src, dst)
-    found = []
-    for f in subs:
-        p = _find(out_dir, name, f["path"])
-        if p and 0 < os.path.getsize(p) <= MAX_SUB_BYTES:
-            found.append((p, f["path"]))
+    found = [(p, rel) for p, rel in found if 0 < os.path.getsize(p) <= MAX_SUB_BYTES]
     return dst, subtitle_names(found, os.path.basename(out_base))
 
 

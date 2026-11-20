@@ -33,12 +33,12 @@ HASH = hashlib.sha1(benc(INFO)).hexdigest()
 MAGNET = f"magnet:?xt=urn:btih:{HASH}&dn=film"
 
 
-def test_info_span_finds_the_hash_part():
-    a, b = worker._info_span(DATA)
+def test_bdecode_finds_the_hash_part():
+    a, b = worker._bdecode(DATA)[1]
     assert hashlib.sha1(DATA[a:b]).hexdigest() == HASH
     for bad in [b"", b"d4:infoi1e", b"l4:spam", b"x", b"d4:info" + b"l" * 100 + b"e" * 100 + b"e", b"d99999:x"]:
         with pytest.raises((ValueError, IndexError)):
-            worker._info_span(bad)
+            worker._bdecode(bad)
 
 
 class FakeResp:

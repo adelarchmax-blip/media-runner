@@ -2,6 +2,7 @@
 a fake MDM command (finished, stalled, failed, files outside the folder)."""
 import json
 import os
+import socket
 import stat
 import sys
 
@@ -66,6 +67,15 @@ if "torrent-info" in args:
         {"index": 2, "path": "../../escape.srt", "size": 10}, {"index": 3, "path": "notes.txt", "size": 4}]}))
     sys.exit(0)
 out = args[args.index("-o") + 1]
+if args[1] == "get":
+    open(os.environ["FAKE_ARGS"] + ".get", "a").write(json.dumps(args) + "\n")
+    if os.environ.get("FAKE_GET") == "fail" or "film" not in args[2] and "English" not in args[2]:
+        open(out + ".mdm.part", "w").write("half")
+        print(json.dumps({"error": "the file's SHA-1 checksum doesn't match"})); sys.exit(1)
+    size = 2000000 if "film" in args[2] else 10
+    open(out, "wb").write(b"y" * size)
+    print(json.dumps({"event": "progress", "downloaded": size, "size": None, "speed": 5, "connections": 1}), flush=True)
+    print(json.dumps({"event": "done", "path": out, "size": size})); sys.exit(0)
 assert args[args.index("--files") + 1] == "0,1,2", args
 open(os.environ["FAKE_ARGS"], "w").write(json.dumps(args))
 if mode == "stall":
@@ -96,6 +106,7 @@ def fake_mdm(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "MIN_VIDEO_BYTES", 1000)
     monkeypatch.setitem(worker._DISK, "held", {})      # process() frees it; these tests call the step alone
     monkeypatch.setattr(worker, "report", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "_public_web", lambda url: False)    # no web source here unless a test says so
     monkeypatch.setenv("FAKE_ARGS", str(tmp_path / "args.json"))
     job = tmp_path / "work" / "7"
     job.mkdir(parents=True)
@@ -286,3 +297,107 @@ def test_page_lane_waits_for_new_pages_while_torrents_run(monkeypatch):
     monkeypatch.setattr(worker, "process", lambda item: done.append(item["id"]))
     worker.page_lane({"pages": 0, "torrents": 0}, busy)
     assert done == [1]
+
+
+def test_web_sources_from_torrent_file_and_magnet(tmp_path):
+    from test_t3_steps import benc
+    info = {"name": "His Girl", "piece length": 16384, "pieces": b"\x01" * 20, "files": [
+        {"path": ["film.mp4"], "length": 2000000, "sha1": "AB" * 20},
+        {"path": ["subs", "English.srt"], "length": 10, "sha1": "short"}]}
+    t = tmp_path / "source.torrent"
+    t.write_bytes(benc({"info": info, "url-list": ["https://a.example/download/", "https://b.example/items"]}))
+    web = worker.web_sources(str(t), MAGNET)
+    assert web["urls"] == ["https://a.example/download/", "https://b.example/items", "https://a.example/d/"]
+    assert web["multi"] is True and web["sha1"] == {"film.mp4": "ab" * 20}
+    one = tmp_path / "one.torrent"
+    one.write_bytes(benc({"info": {"name": "f.mp4", "length": 5, "sha1": "cd" * 20}, "url-list": "https://c.example/f.mp4"}))
+    assert worker.web_sources(str(one), MAGNET) == {"urls": ["https://c.example/f.mp4", "https://a.example/d/"],
+                                                     "multi": False, "sha1": {"f.mp4": "cd" * 20}}
+    bad = tmp_path / "bad.torrent"
+    bad.write_bytes(b"d4:infoi1ee")
+    assert worker.web_sources(str(bad), MAGNET)["urls"] == []
+    assert worker.web_sources(MAGNET, MAGNET) == {"urls": ["https://a.example/d/"], "multi": None, "sha1": {}}
+
+
+def test_webseed_urls_follow_bep19():
+    seeds = ["https://a.example/download/", "https://b.example/2/items", "https://c.example/x.mp4"]
+    assert worker.webseed_urls(seeds, "His Girl", "subs/Eng lish#1.srt", True) == [
+        "https://a.example/download/His%20Girl/subs/Eng%20lish%231.srt",
+        "https://b.example/2/items/His%20Girl/subs/Eng%20lish%231.srt",
+        "https://c.example/x.mp4/His%20Girl/subs/Eng%20lish%231.srt"]
+    assert worker.webseed_urls(seeds, "f.mp4", "f.mp4", False) == [
+        "https://a.example/download/f.mp4", "https://b.example/2/items", "https://c.example/x.mp4"]
+
+
+def test_public_web_refuses_local_and_odd_addresses(monkeypatch):
+    addrs = {"pub.example": "93.184.216.34", "lan.example": "192.168.1.5", "me.example": "127.0.0.1",
+             "v6.example": "::1", "meta.example": "169.254.169.254"}
+
+    def lookup(host, port, **k):
+        if host not in addrs:
+            raise OSError("no such host")
+        return [(0, 0, 0, "", (addrs[host], port))]
+    monkeypatch.setattr(socket, "getaddrinfo", lookup)
+    assert worker._public_web("https://pub.example/a.mp4")
+    for bad in ["https://lan.example/a", "http://me.example/a", "https://v6.example/a", "http://meta.example/",
+                "ftp://pub.example/a", "file:///etc/passwd", "https://u:p@pub.example/a", "https://pub.example/a b",
+                "https://nope.example/a", "https://pub.example:99999/a", None, "https://pub.example/" + "a" * 2001]:
+        assert not worker._public_web(bad), bad
+
+
+class Head:
+    def __init__(self, status, headers):
+        self.status_code, self.headers = status, headers
+        self.is_redirect = status in (301, 302, 303, 307, 308)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_probe_checks_size_and_every_redirect(monkeypatch):
+    monkeypatch.setattr(worker, "_public_web", lambda url: "lan" not in url)
+    answers = {"https://a.example/f": Head(302, {"Location": "https://node.example/f"}),
+               "https://node.example/f": Head(200, {"Content-Length": "100"}),
+               "https://b.example/f": Head(302, {"Location": "http://lan.example/f"}),
+               "https://c.example/f": Head(404, {}),
+               "https://d.example/f": Head(302, {"Location": "/d/f"}),
+               "https://d.example/d/f": Head(200, {})}
+    monkeypatch.setattr(worker.requests, "get", lambda url, **k: answers[url])
+    assert worker._probe("https://a.example/f", 100) == "https://node.example/f"
+    assert worker._probe("https://a.example/f", 99) == ""          # another size: another file
+    assert worker._probe("https://b.example/f", 100) == ""         # redirected into a local network
+    assert worker._probe("https://c.example/f", 100) == ""
+    assert worker._probe("https://d.example/f", 100) == "https://d.example/d/f"
+
+
+def direct_ready(monkeypatch, tmp):
+    monkeypatch.setattr(worker, "_public_web", lambda url: True)
+    monkeypatch.setattr(worker, "_probe", lambda url, size: url)
+    monkeypatch.setenv("FAKE_GET", "ok")
+    return tmp / "args.json.get"
+
+
+def test_direct_web_source_skips_the_torrent(fake_mdm, monkeypatch):
+    tmp, base = fake_mdm
+    calls = direct_ready(monkeypatch, tmp)
+    video, subs = run(base, "ok", monkeypatch)
+    assert video == base + ".mp4" and os.path.getsize(video) == 2000000
+    assert [n for _, n in subs] == ["His Girl (1940).en.srt"]
+    got = [json.loads(x) for x in calls.read_text().splitlines()]
+    assert [a[2] for a in got][:2] == ["https://a.example/d/His%20Girl/film.mp4",
+                                       "https://a.example/d/His%20Girl/subs/English.srt"]
+    assert all(a[:2] == ["--json", "get"] and "--direct" in a for a in got)
+    assert not (tmp / "args.json").exists()                # the torrent engine never started
+
+
+def test_direct_web_source_failing_falls_back_to_torrent(fake_mdm, monkeypatch):
+    tmp, base = fake_mdm
+    calls = direct_ready(monkeypatch, tmp)
+    monkeypatch.setenv("FAKE_GET", "fail")
+    video, subs = run(base, "ok", monkeypatch)
+    assert video == base + ".mp4" and calls.exists()
+    assert json.loads((tmp / "args.json").read_text())[1] == "torrent-get"
+    assert not os.listdir(os.path.join(os.path.dirname(base), "torrent", "direct"))   # failed tries leave nothing
