@@ -353,10 +353,16 @@ function byHostInTurn(links) {
   return out;
 }
 
-// The player frame shows the browser's own error page (the server refused to be framed or to
-// connect): nothing will play there.
-function playerRefused(page) {
-  return page.frames().some((f) => f.parentFrame() && f.url().startsWith("chrome-error://"));
+// The page's player frame itself (its biggest iframe, not an ad frame inside it) shows the
+// browser's own error page (the server refused to be framed or to connect): nothing will play there.
+async function playerRefused(page) {
+  let best = null;
+  for (const el of await page.$$("iframe").catch(() => [])) {
+    const box = await el.boundingBox().catch(() => null);
+    if (box && (!best || box.width * box.height > best.area)) best = { el, area: box.width * box.height };
+  }
+  const frame = best && (await best.el.contentFrame().catch(() => null));
+  return !!frame && frame.url().startsWith("chrome-error://");
 }
 
 // The page's biggest player frame loads another server (what the page's own server buttons do).
@@ -567,7 +573,7 @@ async function main() {
         const box = await videoBox(page);
         if (box) return box;
         // No video 30 s after a server came up (5 s when it refused): the next listed server.
-        const refused = playerRefused(page);
+        const refused = await playerRefused(page);
         if (servers.length > server + 1 && Date.now() - since > (refused ? 5_000 : 30_000)) {
           if (refused) log(`server ${server + 1} refused to open in the page`);
           server += 1;
