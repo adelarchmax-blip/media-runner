@@ -177,13 +177,48 @@ def download(item: dict, out_base: str, progress: Progress) -> str:
     return dst
 
 
-def verify_video(path: str):
+def video_seconds(path: str) -> float:
+    """The longest duration ffprobe reads for the file or any of its streams; 0 when none is written
+    (streamed copies often carry no duration: "N/A")."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=duration", "-of", "json", path],
+                         capture_output=True, text=True, timeout=120)
+    try:
+        info = json.loads(out.stdout or "{}")
+    except ValueError:
+        return 0.0
+    found = [info.get("format", {}).get("duration")] + [st.get("duration") for st in info.get("streams", [])]
+    secs = []
+    for d in found:
+        try:
+            secs.append(float(d))
+        except (TypeError, ValueError):
+            pass
+    return max(secs, default=0.0)
+
+
+def verify_video(path: str) -> str:
+    """Checks the download is a real video and returns its path. A copy whose header holds no
+    duration is rewritten (streams copied, nothing re-encoded) into a Matroska file that does, so
+    the library can show its length and seek in it."""
     if os.path.getsize(path) < MIN_VIDEO_BYTES:
         raise RuntimeError("file too small")
-    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
-                         capture_output=True, text=True, timeout=60)
-    if float(out.stdout.strip() or 0) < MIN_SECONDS:
+    secs = video_seconds(path)
+    if not secs:
+        fixed = os.path.splitext(path)[0] + ".fixed.mkv"
+        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-map", "0", "-c", "copy", fixed],
+                           capture_output=True, text=True, timeout=1800)
+        secs = video_seconds(fixed) if r.returncode == 0 and os.path.exists(fixed) else 0.0
+        if not secs:
+            if os.path.exists(fixed):
+                os.remove(fixed)
+            raise RuntimeError("not a playable video (no duration)")
+        os.remove(path)
+        path = os.path.splitext(path)[0] + ".mkv"
+        os.replace(fixed, path)
+        logging.info(f"  rewritten with its duration ({secs / 60:.0f} min)")
+    if secs < MIN_SECONDS:
         raise RuntimeError("duration too short")
+    return path
 
 
 def remote_exists(remote_path: str) -> bool:
@@ -232,7 +267,7 @@ def process(item: dict):
         progress.push(force=True)
         video = download(item, os.path.join(job_dir, base_name), progress)
         STAGE["now"] = "item_verify"
-        verify_video(video)
+        video = verify_video(video)
         progress.dl_pct = 100
         progress.size_mb = os.path.getsize(video) / 1048576
         progress.push(force=True, ul_pct=0)

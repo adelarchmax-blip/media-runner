@@ -58,3 +58,33 @@ def test_series_never_get_a_sub_section():
     folder, name, root = worker.destination(item)
     assert folder == "m/Series/Foreign_Series/Show/Season 02" and root == "m/Series/Foreign_Series/Show"
     assert name == "Show - S02E03"
+
+
+def test_verify_video_keeps_good_file_and_rewrites_one_without_duration(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    import pytest
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg missing")
+    monkeypatch.setattr(worker, "MIN_VIDEO_BYTES", 1000)
+    good = str(tmp_path / "good.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=8:s=320x240", "-c:v", "mpeg4", good], check=True)
+    assert worker.verify_video(good) == good
+    # A WebM stream written through a pipe has no duration in its header ("N/A"), like a streamed copy.
+    raw = str(tmp_path / "raw.webm")
+    with open(raw, "wb") as f:
+        subprocess.run(["ffmpeg", "-v", "error", "-i", good, "-c:v", "libvpx", "-f", "webm", "pipe:1"], stdout=f, check=True)
+    assert worker.video_seconds(raw) == 0.0
+    fixed = worker.verify_video(raw)
+    assert fixed.endswith("raw.mkv") and not os.path.exists(raw)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["good.mp4", "raw.mkv"]
+    assert 7.5 < worker.video_seconds(fixed) < 8.5
+
+def test_verify_video_refuses_a_non_video(tmp_path, monkeypatch):
+    import pytest
+    monkeypatch.setattr(worker, "MIN_VIDEO_BYTES", 10)
+    page = tmp_path / "page.mp4"
+    page.write_text("<html>not a video</html>" * 10)
+    with pytest.raises(RuntimeError, match="not a playable video"):
+        worker.verify_video(str(page))
+    assert list(tmp_path.iterdir()) == [page]
