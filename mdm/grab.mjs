@@ -285,13 +285,14 @@ async function hostBox(page) {
 const AD = /doubleclick|2mdn\.net|googlesyndication|imasdk|googleads|adservice|adnxs|springserve|spotx|teads|\/ads?\//i;
 
 // The biggest visible video in any frame (not an ad's), its centre in the page's viewport.
-async function videoBox(page) {
+// With `stalled`, a video that holds no data yet counts too.
+async function videoBox(page, stalled = false) {
   await centerPlayer(page);
   let best = null;
   for (const frame of page.frames()) {
     if (AD.test(frame.url())) continue;
     const r = await frame
-      .evaluate((ad) => {
+      .evaluate((ad, stalled) => {
         const AD = new RegExp(ad, "i");
         const vs = [...document.querySelectorAll("video")]
           .filter((e) => !AD.test(e.currentSrc || e.src || ""))
@@ -303,9 +304,9 @@ async function videoBox(page) {
         v.muted = true;
         v.play().catch(() => {});
         // A video that holds no data yet (a player stuck loading) isn't the item yet.
-        if (v.readyState < 2) return null;
+        if (v.readyState < 2 && !stalled) return null;
         return { x: r.left + r.width / 2, y: r.top + r.height / 2, area: r.width * r.height };
-      }, AD.source)
+      }, AD.source, stalled)
       .catch(() => null);
     if (!r || (best && best.area >= r.area)) continue;
     const o = await frameOffset(frame);
@@ -775,6 +776,15 @@ async function main() {
         }
         const box = await videoBox(page);
         if (box) return box;
+        // General rule: a player stuck loading while the extension already shows its button over
+        // it (it found the video's address) is left to MDM, which fetches the video itself.
+        if (Date.now() - since > 20_000 && (await hostBox(page))) {
+          const late = await videoBox(page, true);
+          if (late) {
+            log("the player is stuck loading but the extension found the video: MDM is asked for it");
+            return late;
+          }
+        }
         // No video 30 s after a server came up (5 s when it refused): the next listed server.
         const refused = await playerRefused(page);
         if (servers.length > 1 && Date.now() - since > (refused ? 5_000 : 30_000)) {
