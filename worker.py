@@ -196,13 +196,70 @@ def video_seconds(path: str) -> float:
     return max(secs, default=0.0)
 
 
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+
+
+def _png_end(data, at: int):
+    """Where the PNG image starting at `at` ends (after its IEND chunk), or None if it isn't one."""
+    q = at + 8
+    while q + 12 <= len(data):
+        size = int.from_bytes(data[q:q + 4], "big")
+        kind = bytes(data[q + 4:q + 8])
+        if size > 1 << 24 or not kind.isalpha():
+            return None
+        q += 12 + size
+        if kind == b"IEND":
+            return q if q <= len(data) else None
+    return None
+
+
+def unwrap_image_segments(path: str):
+    """General rule for any server: some hide every piece of a streamed video behind a small fake
+    PNG picture (the piece's real MPEG-TS data follows the picture), so the joined download reads
+    as a few seconds of a 1x1 picture. The pictures are cut out and the pieces' own data kept, as a
+    .ts file next to it (returned; the download is removed). None when the file isn't built so."""
+    import mmap
+    with open(path, "rb") as f:
+        if f.read(8) != PNG_SIG:
+            return None
+        f.seek(0)
+        data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            first = _png_end(data, 0)
+            if first is None or first >= len(data) or data[first] != 0x47:
+                return None
+            out_path = os.path.splitext(path)[0] + ".unwrapped.ts"
+            pictures = 0
+            with open(out_path, "wb") as out:
+                p, n = 0, len(data)
+                while p < n:
+                    if data[p:p + 8] == PNG_SIG:
+                        end = _png_end(data, p)
+                        if end is not None:
+                            pictures += 1
+                            p = end
+                            continue
+                    nxt = data.find(PNG_SIG, p + 1)
+                    nxt = n if nxt == -1 else nxt
+                    out.write(data[p:nxt])
+                    p = nxt
+        finally:
+            data.close()
+    os.remove(path)
+    logging.info(f"  {pictures} fake pictures cut out of the video's pieces")
+    return out_path
+
+
 def verify_video(path: str) -> str:
-    """Checks the download is a real video and returns its path. A copy whose header holds no
-    duration is rewritten (streams copied, nothing re-encoded) into a Matroska file that does, so
-    the library can show its length and seek in it."""
+    """Checks the download is a real video and returns its path. Pieces hidden behind fake pictures
+    are unwrapped first. A copy whose header holds no duration (or an unwrapped stream) is rewritten
+    (streams copied, nothing re-encoded) into a Matroska file, so the library can show its length
+    and seek in it."""
     if os.path.getsize(path) < MIN_VIDEO_BYTES:
         raise RuntimeError("file too small")
-    secs = video_seconds(path)
+    unwrapped = unwrap_image_segments(path)
+    path = unwrapped or path
+    secs = 0.0 if unwrapped else video_seconds(path)
     if not secs:
         fixed = os.path.splitext(path)[0] + ".fixed.mkv"
         r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-map", "0", "-c", "copy", fixed],
@@ -213,7 +270,7 @@ def verify_video(path: str) -> str:
                 os.remove(fixed)
             raise RuntimeError("not a playable video (no duration)")
         os.remove(path)
-        path = os.path.splitext(path)[0] + ".mkv"
+        path = re.sub(r"(\.unwrapped)?\.[^./]+$", "", path) + ".mkv"
         os.replace(fixed, path)
         logging.info(f"  rewritten with its duration ({secs / 60:.0f} min)")
     if secs < MIN_SECONDS:

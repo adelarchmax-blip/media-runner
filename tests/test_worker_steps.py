@@ -88,3 +88,37 @@ def test_verify_video_refuses_a_non_video(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="not a playable video"):
         worker.verify_video(str(page))
     assert list(tmp_path.iterdir()) == [page]
+
+
+# The 1x1 picture a streaming server put in front of every piece (seen live, 70 bytes).
+FAKE_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+    "890000000d49444154789c6360606060000000050001a5f645400000000049454e44ae426082")
+
+
+def test_pieces_hidden_behind_pictures_are_unwrapped(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    import pytest
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg missing")
+    monkeypatch.setattr(worker, "MIN_VIDEO_BYTES", 1000)
+    ts = tmp_path / "real.ts"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=8:s=320x240", "-c:v", "mpeg4",
+                    "-f", "mpegts", str(ts)], check=True)
+    data = ts.read_bytes()
+    piece = 188 * 40
+    hidden = tmp_path / "Embed.mp4"
+    hidden.write_bytes(b"".join(FAKE_PNG + data[i:i + piece] for i in range(0, len(data), piece)))
+    ts.unlink()
+    out = worker.verify_video(str(hidden))
+    assert out == str(tmp_path / "Embed.mkv")
+    assert [p.name for p in tmp_path.iterdir()] == ["Embed.mkv"]
+    assert 7.5 < worker.video_seconds(out) < 8.5
+
+
+def test_a_real_picture_is_not_unwrapped(tmp_path):
+    pic = tmp_path / "poster.png"
+    pic.write_bytes(FAKE_PNG + b"tail that is not a video")
+    assert worker.unwrap_image_segments(str(pic)) is None
+    assert pic.exists()
