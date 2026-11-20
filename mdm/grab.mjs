@@ -49,7 +49,25 @@ async function noteLinks(page, name) {
         .slice(0, 80)
         .map((e) => ({ tag: e.tagName, text: (e.textContent || "").trim().slice(0, 60), box: box(e), attrs: attrs(e) }));
       const frames = [...document.querySelectorAll("iframe")].map((f) => ({ box: box(f), src: (f.src || "").slice(0, 300) }));
-      return { url: location.href, links, frames };
+      // The page's own code around each control's id (inline scripts and same-site script files).
+      const ids = links.map((l) => l.attrs.id).filter(Boolean);
+      const code = [];
+      const near = (text, where) => {
+        for (const id of ids)
+          for (let i = text.indexOf(id); i >= 0 && code.length < 12; i = text.indexOf(id, i + 1)) code.push({ where, id, code: text.slice(Math.max(0, i - 300), i + 900) });
+      };
+      for (const sc of document.querySelectorAll("script:not([src])")) near(sc.textContent || "", "inline");
+      for (const sc of document.querySelectorAll("script[src]")) {
+        const u = new URL(sc.src, location.href);
+        if (u.origin !== location.origin) continue;
+        try {
+          const x = new XMLHttpRequest();
+          x.open("GET", u.href, false);
+          x.send();
+          near(x.responseText || "", u.pathname);
+        } catch {}
+      }
+      return { url: location.href, links, frames, code, scripts: [...document.querySelectorAll("script[src]")].map((e) => e.src.slice(0, 200)) };
     })
     .catch((e) => ({ error: String(e) }));
   fs.writeFileSync(path.join(process.env.MDM_SHOTS, `${name}.json`), JSON.stringify(seen, null, 1));
@@ -665,6 +683,8 @@ async function main() {
       // The page's own watch button: where it leads (a new tab, this tab, or a player shown here).
       const before = page.url();
       following = true;
+      const asked = (r) => process.env.MDM_SHOTS && fs.appendFileSync(path.join(process.env.MDM_SHOTS, "watch-requests.txt"), `${r.method()} ${r.resourceType()} ${r.url().slice(0, 300)}\n`);
+      page.on("request", asked);
       const el = await page.$("[data-mi-watch]");
       await el?.scrollIntoView().catch(() => {});
       await el?.click().catch(() => {});
@@ -681,6 +701,7 @@ async function main() {
         () => log("the watch button led nowhere"),
       );
       following = false;
+      page.off("request", asked);
       await noteLinks(page, "after-watch");
     }
     if (watch) {
