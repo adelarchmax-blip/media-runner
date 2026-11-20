@@ -1,0 +1,109 @@
+name: torrent-probe
+
+# Downloads one torrent through Mister Download Manager's own torrent engine and reports what
+# happened: the torrent's files, the file picked, speed, peers, time, disk use, and whether the
+# result is a real video. Seeding is not done: the command stops when the file is complete.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "A magnet link or an https address of a .torrent file"
+        required: true
+      minutes:
+        description: "Give up after this many minutes"
+        required: false
+        default: "40"
+
+concurrency:
+  group: media-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the input
+        env:
+          SOURCE: ${{ inputs.source }}
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          # Only a magnet link or an https .torrent address, nothing that a shell could read.
+          python3 - <<'EOF'
+          import os, re, sys
+          s, m = os.environ["SOURCE"].strip(), os.environ["MINUTES"].strip()
+          ok = re.fullmatch(r"magnet:\?[A-Za-z0-9%:=&._+\-/]+", s) and re.search(r"xt=urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})", s)
+          ok = ok or re.fullmatch(r"https://[A-Za-z0-9.\-]+(/[A-Za-z0-9%._~\-/]*)?\.torrent", s)
+          if not ok or not re.fullmatch(r"[1-9][0-9]?", m):
+              sys.exit("source must be a magnet link or an https .torrent address; minutes 1-99")
+          EOF
+      - name: Install ffprobe
+        run: |
+          command -v ffprobe >/dev/null || { sudo rm -f /var/lib/man-db/auto-update; sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null; }; }
+      - name: Disk before
+        run: df -h / "$RUNNER_TEMP" | tail -n +1
+      - name: Install Mister Download Manager
+        run: bash mdm/setup.sh
+      - name: Torrent through MDM
+        env:
+          SOURCE: ${{ inputs.source }}
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          set -o pipefail
+          CLI=misterdownloadmanager-cli
+          export MDM_DATA_DIR="$HOME/mdm/data"
+          W="$RUNNER_TEMP/torrent"; mkdir -p "$W/out"
+          SRC="$SOURCE"
+          if [ "${SOURCE#https://}" != "$SOURCE" ]; then
+            curl -fsSL --proto =https --proto-redir =https --max-filesize 5000000 -o "$W/source.torrent" -- "$SOURCE"; SRC="$W/source.torrent"
+          fi
+          echo "::group::torrent-get help"; $CLI help torrent-get || true; echo "::endgroup::"
+          timeout 300 $CLI --json torrent-info "$SRC" > "$W/info.json"
+          # The film: the largest video file, never a sample or trailer; mp4/mkv preferred.
+          PICK=$(python3 - "$W/info.json" <<'EOF'
+          import json, re, sys
+          info = json.load(open(sys.argv[1]))
+          print(f"TORRENT {info['name']} | {info['size']/1048576:.0f} MB | {len(info['files'])} files", file=sys.stderr)
+          vids = [f for f in info["files"] if re.search(r"\.(mp4|mkv|avi|m4v|webm|mov|mpe?g|ts)$", f["path"], re.I)
+                  and not re.search(r"\b(sample|trailer|teaser)\b", f["path"], re.I)]
+          for f in info["files"]:
+              print(f"  {f['index']:>3} {f['size']/1048576:>8.1f} MB  {f['path']}", file=sys.stderr)
+          if not vids:
+              sys.exit("no video file in the torrent")
+          best = max(vids, key=lambda f: (f["path"].lower().endswith((".mp4", ".mkv")), f["size"]))
+          subs = [f["index"] for f in info["files"] if re.search(r"\.(srt|ass|ssa|vtt|sub)$", f["path"], re.I)]
+          print(",".join(map(str, [best["index"], *subs])))
+          print(f"PICKED {best['path']} + {len(subs)} subtitle file(s)", file=sys.stderr)
+          EOF
+          )
+          start=$(date +%s)
+          timeout $((MINUTES*60)) $CLI --json torrent-get "$SRC" -o "$W/out" --files "$PICK" > "$W/get.jsonl" || echo "torrent-get stopped: $?"
+          end=$(date +%s)
+          python3 - "$W/get.jsonl" $((end-start)) <<'EOF'
+          import json, sys
+          rows = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+          prog = [r for r in rows if r.get("event") == "progress"]
+          peers = max((r.get("peers") or 0 for r in prog), default=0)
+          seen = max((r.get("peers_seen") or 0 for r in prog), default=0)
+          top = max((r.get("speed") or 0 for r in prog), default=0)
+          for r in prog[:: max(1, len(prog) // 12)]:
+              print(f"  {r.get('phase')} {(r.get('downloaded') or 0)/1048576:.0f}/{(r.get('size') or 0)/1048576:.0f} MB  {(r.get('speed') or 0)/1048576:.1f} MB/s  peers {r.get('peers')}")
+          done = [r for r in rows if r.get("event") == "done"]
+          secs = int(sys.argv[2])
+          print(f"RESULT {'done' if done else 'not done'} in {secs}s | top speed {top/1048576:.1f} MB/s | peers max {peers}, seen {seen}")
+          if done:
+              d = done[-1]; print(f"PATH {d['path']} | {d['size']/1048576:.0f} MB | avg {d['size']/1048576/max(secs,1):.1f} MB/s")
+          errs = [r for r in rows if "error" in r]
+          if errs: print("ERROR", errs[-1])
+          EOF
+          echo "--- files on disk:"; find "$W/out" -type f -printf '%s %p\n' | sort -rn | head
+          F=$(find "$W/out" -type f -regextype posix-extended -iregex '.*\.(mp4|mkv|avi|m4v|webm|mov|mpe?g|ts)$' -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+          [ -n "$F" ] && ffprobe -v error -show_entries format=duration,size:stream=codec_type,codec_name,width,height -of compact "$F"
+          echo "--- MDM processes left (should be none, no seeding):"; pgrep -af -i misterdownload || echo "(none)"
+          echo "--- disk after:"; df -h / "$RUNNER_TEMP"
+          [ -n "$F" ]
