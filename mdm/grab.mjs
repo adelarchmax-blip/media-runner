@@ -261,6 +261,8 @@ async function videoBox(page) {
         const [v, r] = vs[0];
         v.muted = true;
         v.play().catch(() => {});
+        // A video that holds no data yet (a player stuck loading) isn't the item yet.
+        if (v.readyState < 2) return null;
         return { x: r.left + r.width / 2, y: r.top + r.height / 2, area: r.width * r.height };
       }, AD.source)
       .catch(() => null);
@@ -553,7 +555,7 @@ async function main() {
     let since = Date.now();
     const v = await until(
       "the page's video",
-      90_000 + 30_000 * Math.min(servers.length, 3),
+      90_000 + 30_000 * Math.min(servers.length, 5),
       async () => {
         // A click on the player can open an ad in place of the page: back to the watch page.
         if (page.url() !== startUrl && !page.url().startsWith(startUrl)) {
