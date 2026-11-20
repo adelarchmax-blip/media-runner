@@ -393,6 +393,35 @@ async function markWatchButton(page) {
     .catch(() => false);
 }
 
+// General rule for any site: a watch button may first show a small notice (follow our channel,
+// confirm, continue) whose own button lets the page go on, often after a countdown. That button
+// (short text saying done/continue/confirm, not a link to another site, not the watch button) is
+// clicked once. Returns true when it clicked one.
+async function confirmNotice(page) {
+  const el = await page
+    .evaluateHandle(() => {
+      const words = /^(.{0,3})(لقد اشتركت|اشتركت|تم الاشتراك|تم|متابعة|استمرار|استمر|أكمل|اكمل|موافق|تأكيد|continue|confirm|i subscribed|subscribed|done|ok|proceed)(.{0,3})$/i;
+      for (const e of document.querySelectorAll("a,button,[role=button],input[type=button],input[type=submit]")) {
+        if (e.hasAttribute("data-mi-watch") || e.hasAttribute("data-mi-done")) continue;
+        const r = e.getBoundingClientRect();
+        const st = getComputedStyle(e);
+        if (r.width < 16 || r.height < 12 || st.visibility === "hidden" || st.display === "none" || r.bottom < 0 || r.top > innerHeight) continue;
+        const text = (e.value || e.textContent || "").trim().replace(/\s+/g, " ");
+        if (text.length > 30 || !words.test(text)) continue;
+        const href = e.getAttribute("href") || "";
+        if (/^https?:|^\/\//i.test(href) && new URL(href, location.href).origin !== location.origin) continue;
+        e.setAttribute("data-mi-done", "1");
+        return e;
+      }
+      return null;
+    })
+    .catch(() => null);
+  const real = el && el.asElement();
+  if (!real) return false;
+  await real.click().catch(() => {});
+  return true;
+}
+
 // General rule for any site: a watch page often lists its servers in its code, as other sites'
 // player addresses in its buttons' data attributes (data-link, data-src, data-url, data-embed).
 // The list keeps the page's order, starting with the one already in the player frame.
@@ -683,25 +712,33 @@ async function main() {
       // The page's own watch button: where it leads (a new tab, this tab, or a player shown here).
       const before = page.url();
       following = true;
-      const asked = (r) => process.env.MDM_SHOTS && fs.appendFileSync(path.join(process.env.MDM_SHOTS, "watch-requests.txt"), `${r.method()} ${r.resourceType()} ${r.url().slice(0, 300)}\n`);
-      page.on("request", asked);
       const el = await page.$("[data-mi-watch]");
       await el?.scrollIntoView().catch(() => {});
       await el?.click().catch(() => {});
       log("no player and no watch link: the page's watch button was clicked");
+      const clicked = Date.now();
+      let noticed = false;
       await until(
         "the watch button to lead somewhere",
-        15_000,
-        async () => opened || (page.url().split("#")[0] !== before.split("#")[0] ? page.url() : null) || ((await hasPlayer(page)) ? "here" : null) || (await watchPageLink(page)),
+        45_000,
+        async () => {
+          const to = opened || (page.url().split("#")[0] !== before.split("#")[0] ? page.url() : null) || ((await hasPlayer(page)) ? "here" : null) || (await watchPageLink(page));
+          if (!to && (await confirmNotice(page))) {
+            noticed = true;
+            log("the page showed a notice first: its continue button was clicked");
+          }
+          // Without a notice (and its countdown), a button that did nothing in 15 s leads nowhere.
+          return to || (!noticed && Date.now() - clicked > 15_000 ? "nowhere" : null);
+        },
         500,
       ).then(
         (to) => {
-          if (to !== "here" && to !== page.url()) watch = to;
+          if (to === "nowhere") log("the watch button led nowhere");
+          else if (to !== "here" && to !== page.url()) watch = to;
         },
         () => log("the watch button led nowhere"),
       );
       following = false;
-      page.off("request", asked);
       await noteLinks(page, "after-watch");
     }
     if (watch) {
