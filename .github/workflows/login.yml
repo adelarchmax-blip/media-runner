@@ -60,7 +60,7 @@ jobs:
           sudo mkdir -p "$NOVNC_DIR" && sudo tar xzf novnc.tgz -C "$NOVNC_DIR" --strip-components=1
           curl -sSfL -o websockify-0.12.0-py3-none-any.whl https://files.pythonhosted.org/packages/py3/w/websockify/websockify-0.12.0-py3-none-any.whl
           echo "4443e363ba16077e8b62dbb0cfafa44b9ba8f49de5048f011769f006e0d686aa  websockify-0.12.0-py3-none-any.whl" | sha256sum -c --quiet
-          pip install -q --no-deps ./websockify-0.12.0-py3-none-any.whl numpy requests
+          pip install -q --no-deps ./websockify-0.12.0-py3-none-any.whl && pip install -q numpy requests
           cd "$GITHUB_WORKSPACE/mdm" && npm ci --no-audit --no-fund --silent
 
       - name: Sign-in browser
