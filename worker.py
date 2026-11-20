@@ -23,6 +23,7 @@ API_TOKEN = os.environ["RUNNER_API_TOKEN"]
 REMOTE = os.environ["RCLONE_REMOTE"].rstrip(":")
 MEDIA_BASE = os.environ["MEDIA_BASE_PATH"].strip("/")
 RUN_ID = os.environ.get("RUN_ID", "local")
+TORRENTS_ONLY = os.environ.get("LANES", "all") == "torrents"     # the owner can skip the watch-page lane
 WORK_DIR = os.path.abspath("work")
 
 START = float(os.environ.get("RUN_STARTED") or 0) or time.time()
@@ -942,7 +943,8 @@ def main():
     lane = threading.Thread(target=torrent_lane, args=(count, busy), daemon=True)
     lane.start()
     try:
-        page_lane(count, busy)
+        if not TORRENTS_ONLY:
+            page_lane(count, busy)
         lane.join()
     finally:
         stop.set()

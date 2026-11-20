@@ -299,6 +299,19 @@ def test_page_lane_waits_for_new_pages_while_torrents_run(monkeypatch):
     assert done == [1]
 
 
+
+@pytest.mark.parametrize("only", [True, False])
+def test_torrents_only_run_never_asks_for_watch_pages(monkeypatch, only):
+    asked = []
+    monkeypatch.setattr(worker, "TORRENTS_ONLY", only)
+    monkeypatch.setattr(worker, "EMPTY_RECHECK", 0.01)
+    monkeypatch.setattr(worker, "restore_sessions", lambda: None)
+    monkeypatch.setattr(worker, "heartbeat_loop", lambda stop: None)
+    monkeypatch.setattr(worker, "set_stage", lambda stage: None)
+    monkeypatch.setattr(worker, "next_items", lambda kind, n, tag: asked.append(kind) or [])
+    worker.main()
+    assert ("page" in asked) is not only and "torrent" in asked
+
 def test_web_sources_from_torrent_file_and_magnet(tmp_path):
     from test_t3_steps import benc
     info = {"name": "His Girl", "piece length": 16384, "pieces": b"\x01" * 20, "files": [
