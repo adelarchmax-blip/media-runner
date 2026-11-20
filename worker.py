@@ -262,7 +262,7 @@ def verify_video(path: str) -> str:
     secs = 0.0 if unwrapped else video_seconds(path)
     if not secs:
         fixed = os.path.splitext(path)[0] + ".fixed.mkv"
-        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-map", "0", "-c", "copy", fixed],
+        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-map", "0:v", "-map", "0:a?", "-map", "0:s?", "-c", "copy", fixed],
                            capture_output=True, text=True, timeout=1800)
         secs = video_seconds(fixed) if r.returncode == 0 and os.path.exists(fixed) else 0.0
         if not secs:

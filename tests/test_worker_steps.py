@@ -103,9 +103,13 @@ def test_pieces_hidden_behind_pictures_are_unwrapped(tmp_path, monkeypatch):
     if not shutil.which("ffmpeg"):
         pytest.skip("ffmpeg missing")
     monkeypatch.setattr(worker, "MIN_VIDEO_BYTES", 1000)
+    # Real pieces carry a data track (timed ID3) besides picture and sound; Matroska can't hold one.
+    (tmp_path / "id3.bin").write_bytes(os.urandom(2000))
     ts = tmp_path / "real.ts"
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=8:s=320x240", "-c:v", "mpeg4",
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=8:s=320x240", "-f", "data",
+                    "-i", str(tmp_path / "id3.bin"), "-map", "0", "-map", "1", "-c:v", "mpeg4", "-c:d", "copy",
                     "-f", "mpegts", str(ts)], check=True)
+    (tmp_path / "id3.bin").unlink()
     data = ts.read_bytes()
     piece = 188 * 40
     hidden = tmp_path / "Embed.mp4"
