@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       source:
-        description: "A magnet link or an https address of a .torrent file"
+        description: "Up to 6 magnet links or https .torrent addresses, separated by spaces (tried one after another)"
         required: true
       minutes:
         description: "Give up after this many minutes"
@@ -25,9 +25,9 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Check the input
         env:
           SOURCE: ${{ inputs.source }}
@@ -36,11 +36,14 @@ jobs:
           # Only a magnet link or an https .torrent address, nothing that a shell could read.
           python3 - <<'EOF'
           import os, re, sys
-          s, m = os.environ["SOURCE"].strip(), os.environ["MINUTES"].strip()
-          ok = re.fullmatch(r"magnet:\?[A-Za-z0-9%:=&._+\-/]+", s) and re.search(r"xt=urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})", s)
-          ok = ok or re.fullmatch(r"https://[A-Za-z0-9.\-]+(/[A-Za-z0-9%._~\-/]*)?\.torrent", s)
-          if not ok or not re.fullmatch(r"[1-9][0-9]?", m):
-              sys.exit("source must be a magnet link or an https .torrent address; minutes 1-99")
+          items, m = os.environ["SOURCE"].split(), os.environ["MINUTES"].strip()
+          def ok(s):
+              if re.fullmatch(r"magnet:\?[A-Za-z0-9%:=&._+\-/]+", s):
+                  return re.search(r"xt=urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})", s)
+              # an https .torrent address; a query (?type=torrent&file=x.torrent) is allowed
+              return re.fullmatch(r"https?://[A-Za-z0-9.\-]+(/[A-Za-z0-9%._~\-/]*)?(\?[A-Za-z0-9%._~\-=&]*)?", s) and ".torrent" in s
+          if not 1 <= len(items) <= 6 or not all(ok(s) for s in items) or not re.fullmatch(r"[1-9][0-9]?", m):
+              sys.exit("source: 1-6 magnet links or .torrent addresses; minutes 1-99")
           EOF
       - name: Install ffprobe
         run: |
@@ -51,19 +54,23 @@ jobs:
         run: bash mdm/setup.sh
       - name: Torrent through MDM
         env:
-          SOURCE: ${{ inputs.source }}
+          SOURCES: ${{ inputs.source }}
           MINUTES: ${{ inputs.minutes }}
         run: |
           set -o pipefail
           CLI=misterdownloadmanager-cli
           export MDM_DATA_DIR="$HOME/mdm/data"
-          W="$RUNNER_TEMP/torrent"; mkdir -p "$W/out"
+          N=0; OKS=0
+          set -f        # the addresses hold "?": no file-name expansion
+          for SOURCE in $SOURCES; do
+          N=$((N+1)); echo "=================== torrent $N"
+          W="$RUNNER_TEMP/torrent$N"; mkdir -p "$W/out"
           SRC="$SOURCE"
-          if [ "${SOURCE#https://}" != "$SOURCE" ]; then
-            curl -fsSL --proto =https --proto-redir =https --max-filesize 5000000 -o "$W/source.torrent" -- "$SOURCE"; SRC="$W/source.torrent"
-          fi
-          echo "::group::torrent-get help"; $CLI help torrent-get || true; echo "::endgroup::"
-          timeout 300 $CLI --json torrent-info "$SRC" > "$W/info.json"
+          case "$SOURCE" in http*)
+            curl -fsSL --max-filesize 5000000 -o "$W/source.torrent" -- "$SOURCE" || { echo "RESULT the .torrent file did not download"; continue; }
+            SRC="$W/source.torrent";;
+          esac
+          timeout 300 $CLI --json torrent-info "$SRC" > "$W/info.json" || { echo "RESULT no file list (dead?)"; continue; }
           # The film: the largest video file, never a sample or trailer; mp4/mkv preferred.
           PICK=$(python3 - "$W/info.json" <<'EOF'
           import json, re, sys
@@ -80,7 +87,7 @@ jobs:
           print(",".join(map(str, [best["index"], *subs])))
           print(f"PICKED {best['path']} + {len(subs)} subtitle file(s)", file=sys.stderr)
           EOF
-          )
+          ) || { echo "RESULT no video file in it"; continue; }
           start=$(date +%s)
           timeout $((MINUTES*60)) $CLI --json torrent-get "$SRC" -o "$W/out" --files "$PICK" > "$W/get.jsonl" || echo "torrent-get stopped: $?"
           end=$(date +%s)
@@ -103,7 +110,7 @@ jobs:
           EOF
           echo "--- files on disk:"; find "$W/out" -type f -printf '%s %p\n' | sort -rn | head
           F=$(find "$W/out" -type f -regextype posix-extended -iregex '.*\.(mp4|mkv|avi|m4v|webm|mov|mpe?g|ts)$' -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
-          [ -n "$F" ] && ffprobe -v error -show_entries format=duration,size:stream=codec_type,codec_name,width,height -of compact "$F"
+          [ -n "$F" ] && { ffprobe -v error -show_entries format=duration,size:stream=codec_type,codec_name,width,height -of compact "$F" || true; }
           echo "--- MDM processes left (should be none, no seeding):"; pgrep -af -i misterdownload || echo "(none)"
           echo "--- disk after:"; df -h / "$RUNNER_TEMP"
           [ -n "$F" ]

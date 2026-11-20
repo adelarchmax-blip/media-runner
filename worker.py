@@ -52,8 +52,8 @@ def api(path: str, payload: dict) -> dict:
     return {}
 
 
-def report(item_id: int, status: str, stage: str = "", **extra):
-    api("miinspact-report", {"item_id": item_id, "status": status, "run_id": RUN_ID,
+def report(item_id: int, status: str, stage: str = "", **extra) -> dict:
+    return api("miinspact-report", {"item_id": item_id, "status": status, "run_id": RUN_ID,
                              "run_started_at": START, "stage": stage or STAGE["now"], **extra})
 
 
@@ -109,6 +109,10 @@ def destination(item: dict) -> tuple:
     return folder, f"{title}{year}", folder
 
 
+class Stopped(Exception):
+    """The owner stopped this one item from the dashboard."""
+
+
 class Progress:
     def __init__(self, item_id: int):
         self.item_id = item_id
@@ -117,12 +121,26 @@ class Progress:
         self.speed = 0.0
         self.size_mb = 0.0
         self.stage = "item_details"    # each item its own stage: torrents run side by side
+        self.stopped = False
+        self.procs = []                # this item's running commands, stopped at once on "stop"
 
     def push(self, force: bool = False, **extra):
         if force or time.time() - self.last >= REPORT_INTERVAL:
             self.last = time.time()
-            report(self.item_id, "downloading", stage=self.stage, dl_pct=self.dl_pct,
-                   speed_mbs=round(self.speed, 2), size_mb=round(self.size_mb, 1), **extra)
+            res = report(self.item_id, "downloading", stage=self.stage, dl_pct=self.dl_pct,
+                         speed_mbs=round(self.speed, 2), size_mb=round(self.size_mb, 1), **extra)
+            if isinstance(res, dict) and res.get("stop") is True:
+                self.stop_now()
+        self.check()
+
+    def stop_now(self):
+        self.stopped = True
+        for proc in list(self.procs):
+            _kill_group(proc)
+
+    def check(self):
+        if self.stopped:
+            raise Stopped()
 
 
 _URL = re.compile(r"\S*(?:https?://|www\.)\S*", re.I)
@@ -173,6 +191,14 @@ def _start_group(cmd, env, **kw):
     return proc
 
 
+def _kill_group(proc):
+    """Stops a command started in its own session (start_new_session) with everything it started."""
+    try:
+        os.killpg(proc.pid, 9)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def _stop_group(proc):
     try:
         os.killpg(proc.pid, 9)
@@ -217,7 +243,8 @@ def download(item: dict, out_base: str, progress: Progress) -> str:
     steps_log = os.path.dirname(out_base) + "/grab.log"
     with open(steps_log, "w") as steps:
         proc = subprocess.Popen(["xvfb-run", "-a", "-s", "-screen 0 2400x1000x24", "node", MDM_GRAB, item["watch_url"], out_dir],
-                                stdout=subprocess.PIPE, stderr=steps, text=True)
+                                stdout=subprocess.PIPE, stderr=steps, text=True, start_new_session=True)
+        progress.procs.append(proc)
         result = {}
         for line in proc.stdout:
             try:
@@ -231,7 +258,9 @@ def download(item: dict, out_base: str, progress: Progress) -> str:
             else:
                 result = msg
         proc.wait()
+        progress.procs.remove(proc)
     stop_leftover_mdm()
+    progress.check()
     if not result.get("ok"):
         steps_seen = last_steps(steps_log)
         for step in steps_seen:
@@ -322,6 +351,101 @@ def _find(root: str, name, rel: str):
     return _inside(root, rel) or (_inside(root, os.path.join(name, rel)) if isinstance(name, str) and name else None)
 
 
+MAX_TORRENT_FILE = 2 * 1048576
+SESSIONS_FILE = os.path.join(os.environ.get("RUNNER_TEMP") or "/tmp", "miinspact-sessions.json")
+
+
+def _info_span(data: bytes):
+    """Where the `info` dictionary sits inside a .torrent (its SHA-1 is the torrent's hash). Strict and bounded."""
+    pos = [0]
+
+    def skip(depth=0):
+        if depth > 64 or pos[0] >= len(data):
+            raise ValueError("bad torrent")
+        c = data[pos[0]:pos[0] + 1]
+        if c == b"i":
+            end = data.index(b"e", pos[0])
+            pos[0] = end + 1
+        elif c in (b"l", b"d"):
+            is_dict = c == b"d"
+            pos[0] += 1
+            found = None
+            while data[pos[0]:pos[0] + 1] != b"e":
+                key_start = pos[0]
+                skip(depth + 1)
+                if is_dict:
+                    key = data[key_start:pos[0]]
+                    start = pos[0]
+                    skip(depth + 1)
+                    if depth == 0 and key == b"4:info":
+                        found = (start, pos[0])
+            pos[0] += 1
+            return found
+        elif c.isdigit():
+            colon = data.index(b":", pos[0])
+            length = int(data[pos[0]:colon])
+            if length < 0 or colon + 1 + length > len(data):
+                raise ValueError("bad torrent")
+            pos[0] = colon + 1 + length
+        else:
+            raise ValueError("bad torrent")
+        return None
+    span = skip()
+    if not span:
+        raise ValueError("no info in torrent")
+    return span
+
+
+def _session_cookie(url: str) -> str:
+    """Cookie header for a signed-in site (sessions the owner saved through login.yml)."""
+    from urllib.parse import urlsplit
+    try:
+        with open(SESSIONS_FILE) as f:
+            sessions = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    host = (urlsplit(url).hostname or "").lower()
+    for s in sessions if isinstance(sessions, list) else []:
+        dom = str(s.get("domain") or "")
+        if host == dom or host.endswith("." + dom):
+            return "; ".join(f"{c['name']}={c['value']}" for c in s.get("cookies", [])
+                             if isinstance(c, dict) and host.endswith(str(c.get("domain", "")).lstrip(".")))
+    return ""
+
+
+def torrent_source(item: dict, job_dir: str, link: str) -> str:
+    """The .torrent file when the site gave one (it knows the files and the site's own direct sources,
+    so no peer is needed to start), checked to be the same torrent as the magnet; else the magnet."""
+    import hashlib
+    url = item.get("torrent_url") or ""
+    if not re.match(r"^https?://[^\s\"'<>\\]+$", url) or len(url) > 2000:
+        return link
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36"}
+        cookie = _session_cookie(url)
+        if cookie:
+            headers["Cookie"] = cookie
+        with requests.get(url, headers=headers, timeout=30, stream=True) as r:
+            r.raise_for_status()
+            data = b""
+            for chunk in r.iter_content(65536):
+                data += chunk
+                if len(data) > MAX_TORRENT_FILE:
+                    raise ValueError("torrent file too big")
+        a, b = _info_span(data)
+        want = re.search(r"btih:([0-9a-fA-F]{40})", link)
+        if not want or hashlib.sha1(data[a:b]).hexdigest() != want.group(1).lower():
+            raise ValueError("torrent file is not the same torrent")
+        path = os.path.join(job_dir, "source.torrent")
+        with open(path, "wb") as f:
+            f.write(data)
+        logging.info("  torrent: using the site's .torrent file")
+        return path
+    except (requests.RequestException, ValueError) as e:
+        logging.info(f"  torrent: no .torrent file ({type(e).__name__}), using the magnet")
+        return link
+
+
 def download_torrent(item: dict, out_base: str, progress: Progress) -> tuple:
     """تحميل تورنت بمحرك Mister Download Manager نفسه: الفيلم + ملفات الترجمة بس، ومن غير مشاركة
     بعد الانتهاء. بيرجّع (مسار الفيديو، [(مسار ترجمة، اسمها في المكتبة)])."""
@@ -330,15 +454,19 @@ def download_torrent(item: dict, out_base: str, progress: Progress) -> tuple:
     out_dir = os.path.join(job_dir, "torrent")
     os.makedirs(out_dir, exist_ok=True)
     env = {**os.environ, "MDM_DATA_DIR": os.path.join(job_dir, "mdm-data")}
-    info = _start_group([MDM_CLI, "--json", "torrent-info", link], env, stdout=subprocess.PIPE,
+    source = torrent_source(item, job_dir, link)
+    info = _start_group([MDM_CLI, "--json", "torrent-info", source], env, stdout=subprocess.PIPE,
                         stderr=subprocess.DEVNULL, text=True)
+    progress.procs.append(info)
     try:
         out, _ = info.communicate(timeout=TORRENT_INFO_WAIT)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"{DEAD}: no one shares its file list") from None
     finally:
         _stop_group(info)
+        progress.procs.remove(info)
         info.stdout.close()
+    progress.check()
     try:
         meta = json.loads((out.strip().splitlines() or [""])[-1])
     except ValueError:
@@ -354,8 +482,9 @@ def download_torrent(item: dict, out_base: str, progress: Progress) -> tuple:
     progress.stage = "item_download"
     hold_disk(int(item["id"]), best["size"] * 2 + sum(f["size"] for f in subs))   # the film + its moved copy
     wanted = ",".join(str(f["index"]) for f in [best, *subs])
-    proc = _start_group([MDM_CLI, "--json", "torrent-get", link, "-o", out_dir, "--files", wanted,
+    proc = _start_group([MDM_CLI, "--json", "torrent-get", source, "-o", out_dir, "--files", wanted,
                          "--seconds", str(budget)], env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    progress.procs.append(proc)
     state = {"moved": time.time(), "stalled": False}
     finished = threading.Event()
 
@@ -390,7 +519,9 @@ def download_torrent(item: dict, out_base: str, progress: Progress) -> tuple:
     finally:
         finished.set()
         _stop_group(proc)
+        progress.procs.remove(proc)
         proc.stdout.close()
+    progress.check()
     if end.get("event") != "done":
         if state["stalled"] and seen <= 0:      # not one byte from anybody: dead from the start
             raise RuntimeError(f"{DEAD}: nobody sent any part of it | peers max {peers}")
@@ -523,7 +654,8 @@ def upload(local: str, remote_path: str, progress: Progress) -> float:
     started = time.time()
     proc = subprocess.Popen(["rclone", "copyto", local, f"{REMOTE}:{remote_path}", "--stats", "5s",
                              "--use-json-log", "--log-level", "INFO", "--drive-chunk-size", "64M"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    progress.procs.append(proc)
     for line in proc.stderr:
         try:
             stats = json.loads(line).get("stats") or {}
@@ -532,7 +664,10 @@ def upload(local: str, remote_path: str, progress: Progress) -> float:
         total = stats.get("totalBytes") or 0
         if total:
             progress.push(ul_pct=int(stats.get("bytes", 0) * 100 / total))
-    if proc.wait() != 0:
+    code = proc.wait()
+    progress.procs.remove(proc)
+    progress.check()
+    if code != 0:
         raise RuntimeError("upload failed")
     return os.path.getsize(local) / 1048576 / max(1.0, time.time() - started)
 
@@ -582,7 +717,14 @@ def process(item: dict):
         report(item_id, "uploaded", stage=progress.stage, dl_pct=100, ul_pct=100, size_mb=round(progress.size_mb, 1),
                speed_mbs=round(speed, 2), gdrive_path=remote_video)
         logging.info(f"item {item_id}: uploaded ({progress.size_mb:.0f} MB)")
+    except Stopped:
+        logging.info(f"item {item_id}: stopped by the owner, its files are removed")
+        if item.get("kind") != "torrent":
+            stop_leftover_mdm()
     except Exception as e:
+        if progress.stopped:      # a command cut by "stop" fails on its own: not a real failure
+            logging.info(f"item {item_id}: stopped by the owner, its files are removed")
+            return
         logging.warning(f"item {item_id}: failed ({type(e).__name__})")
         report(item_id, "failed", stage=progress.stage, error=f"{type(e).__name__}: {str(e)[:300]}")
     finally:
@@ -644,7 +786,21 @@ def torrent_lane(count: dict, busy: threading.Event):
         busy.clear()
 
 
+def restore_sessions():
+    """Sign-ins the owner saved (login.yml) come back on every new runner: Chrome (grab.mjs) and
+    .torrent downloads use them. The file is readable by this user only and is never logged."""
+    sessions = api("miinspact-login", {"op": "sessions"}).get("sessions") or []
+    if not isinstance(sessions, list) or not sessions:
+        return
+    fd = os.open(SESSIONS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(sessions, f)
+    os.environ["MDM_SESSIONS"] = SESSIONS_FILE
+    logging.info(f"{len(sessions)} saved sign-in(s) restored")
+
+
 def main():
+    restore_sessions()
     stop = threading.Event()
     threading.Thread(target=heartbeat_loop, args=(stop,), daemon=True).start()
     set_stage("working")

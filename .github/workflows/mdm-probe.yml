@@ -19,8 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
       - name: Install tools
@@ -74,7 +74,7 @@ jobs:
           grep -v "usvg\|zbus\|XSETTINGS\|portal" "$D/logs/mdm.log" 2>/dev/null | tail -n 60 | cut -c1-400 || true
           echo "--- video-info"
           MDM_DATA_DIR="$D" timeout 120 misterdownloadmanager-cli video-info "${PAGE_URLS%% *}" 2>&1 | cut -c1-600 | head -20 || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: probe-shots

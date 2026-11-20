@@ -1,0 +1,67 @@
+name: login
+
+# The owner's sign-in browser: started from the dashboard (through n8n) with a session number only.
+# Nothing here names a site, and the log never shows the screen's address or password (masked).
+on:
+  workflow_dispatch:
+    inputs:
+      session:
+        description: session number
+        required: true
+
+concurrency:
+  group: login-browser
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+    env:
+      RUNNER_API_URL: ${{ secrets.RUNNER_API_URL }}
+      RUNNER_API_TOKEN: ${{ secrets.RUNNER_API_TOKEN }}
+      LOGIN_SESSION: ${{ inputs.session }}
+      NOVNC_DIR: /opt/novnc
+    steps:
+      - name: Check the session number
+        run: |
+          case "$LOGIN_SESSION" in
+            *[!a-f0-9]*|"") echo "bad session number"; exit 1;;
+          esac
+          [ ${#LOGIN_SESSION} -eq 24 ] || { echo "bad session number"; exit 1; }
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install the screen tools
+        # Pinned versions, each checked against its published SHA-256 before use.
+        run: |
+          need=""; for c in x11vnc xvfb; do b=$c; [ $c = xvfb ] && b=Xvfb; command -v $b >/dev/null || need="$need $c"; done
+          if [ -n "$need" ]; then
+            sudo rm -f /var/lib/man-db/auto-update
+            sudo apt-get install -y -qq --no-install-recommends $need > /dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $need > /dev/null; }
+          fi
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o cf.deb https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-linux-amd64.deb
+          echo "70b1a1e0f46033ffc8d90b406e554044ba6cbf2e4360295ef1163aed31e09393  cf.deb" | sha256sum -c --quiet
+          sudo dpkg -i cf.deb > /dev/null
+          curl -sSfL -o novnc.tgz https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.tar.gz
+          echo "5066103959ef4e9b10f37e5a148627360dd8414e4cf8a7db92bdbd022e728aaa  novnc.tgz" | sha256sum -c --quiet
+          sudo mkdir -p "$NOVNC_DIR" && sudo tar xzf novnc.tgz -C "$NOVNC_DIR" --strip-components=1
+          curl -sSfL -o websockify-0.12.0-py3-none-any.whl https://files.pythonhosted.org/packages/py3/w/websockify/websockify-0.12.0-py3-none-any.whl
+          echo "4443e363ba16077e8b62dbb0cfafa44b9ba8f49de5048f011769f006e0d686aa  websockify-0.12.0-py3-none-any.whl" | sha256sum -c --quiet
+          pip install -q --no-deps ./websockify-0.12.0-py3-none-any.whl numpy requests
+          cd "$GITHUB_WORKSPACE/mdm" && npm ci --no-audit --no-fund --silent
+
+      - name: Sign-in browser
+        run: python login/session.py

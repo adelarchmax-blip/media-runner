@@ -19,12 +19,12 @@ jobs:
       RUNNER_API_TOKEN: ${{ secrets.RUNNER_API_TOKEN }}
       RUN_ID: ${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Report start
         run: echo "RUN_STARTED=$(date +%s)" >> "$GITHUB_ENV" && RUN_STARTED=$(date +%s) sh stage.sh booting
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: pip
@@ -40,7 +40,7 @@ jobs:
           fi
           pip install -q -r requirements.txt
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
 

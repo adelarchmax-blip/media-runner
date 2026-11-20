@@ -508,6 +508,29 @@ async function stopApp(app) {
   if (!gone()) log("MDM did not stop");
 }
 
+// Sign-ins the owner made in the runner's browser (login.yml) come back here: only the cookies of the
+// item's own site, from the file worker.py wrote (MDM_SESSIONS, readable by this user only).
+function sessionCookies(pageUrl) {
+  let host = "";
+  try { host = new URL(pageUrl).hostname.toLowerCase(); } catch { return []; }
+  let sessions = [];
+  try { sessions = JSON.parse(fs.readFileSync(process.env.MDM_SESSIONS || "", "utf8")); } catch { return []; }
+  if (!Array.isArray(sessions)) return [];
+  const out = [];
+  for (const s of sessions) {
+    const dom = String(s?.domain || "");
+    if (!dom || !(host === dom || host.endsWith("." + dom))) continue;
+    for (const c of Array.isArray(s.cookies) ? s.cookies : []) {
+      if (typeof c?.name !== "string" || typeof c?.value !== "string" || typeof c?.domain !== "string") continue;
+      const cookie = { name: c.name, value: c.value, domain: c.domain, path: typeof c.path === "string" ? c.path : "/",
+        secure: c.secure === true, httpOnly: c.httpOnly === true, sameSite: ["Strict", "Lax", "None"].includes(c.sameSite) ? c.sameSite : "Lax" };
+      if (typeof c.expires === "number" && c.expires > 0) cookie.expires = c.expires;
+      out.push(cookie);
+    }
+  }
+  return out;
+}
+
 async function main() {
   prepareData();
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "mdm-chrome-"));
@@ -539,6 +562,12 @@ async function main() {
       browser.targets().find((t) => t.type() === "service_worker" && t.url().includes(id)),
     );
     log(`extension ${id} loaded`);
+
+    const signed = sessionCookies(url);
+    if (signed.length) {
+      await bcdp.send("Storage.setCookies", { cookies: signed }).catch(() => {});
+      log(`${signed.length} saved sign-in cookie(s) restored`);
+    }
 
     const before = new Set((await mdmList()).map((d) => d.id));
     const page = await browser.newPage();
