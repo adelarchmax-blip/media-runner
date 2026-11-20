@@ -332,6 +332,49 @@ async function watchPageLink(page) {
     .catch(() => null);
 }
 
+// The page shows a player of its own: a big visible video, or a big visible frame with an address.
+async function hasPlayer(page) {
+  return page
+    .evaluate(() => {
+      const ok = (e) => {
+        const r = e.getBoundingClientRect();
+        const st = getComputedStyle(e);
+        return r.width >= 300 && r.height >= 150 && st.visibility !== "hidden" && st.display !== "none";
+      };
+      return [...document.querySelectorAll("video")].some(ok) || [...document.querySelectorAll("iframe")].some((f) => ok(f) && f.src && f.src !== "about:blank");
+    })
+    .catch(() => false);
+}
+
+// General rule for any site: a watch control that is not a link (a script button: no address,
+// "javascript:", or only a "#" mark in the page) is clicked the way a person does, when the page
+// has neither a player nor a watch link. Script buttons rank above "#" marks (those only scroll).
+// Marks the chosen control and returns true when there is one.
+async function markWatchButton(page) {
+  return page
+    .evaluate(() => {
+      const seen = (e) => {
+        const r = e.getBoundingClientRect();
+        const st = getComputedStyle(e);
+        return r.width >= 16 && r.height >= 12 && st.visibility !== "hidden" && st.display !== "none" && !e.closest("[aria-hidden=true]");
+      };
+      const named = /^(مشاهدة|شاهد|شاهد الآن|مشاهدة الآن|مشاهدة مباشرة|watch|watch now|play)$/i;
+      let pick = null;
+      for (const e of document.querySelectorAll("a,button,[role=button]")) {
+        const text = (e.textContent || "").trim().replace(/\s+/g, " ");
+        if (!seen(e) || text.length > 25 || !named.test(text)) continue;
+        const href = (e.getAttribute("href") || "").trim();
+        if (/^https?:|^\/[^/]/i.test(href)) continue;
+        const score = !href || /^javascript:/i.test(href) ? 2 : 1;
+        if (!pick || score > pick.score) pick = { e, score };
+      }
+      if (!pick) return false;
+      pick.e.setAttribute("data-mi-watch", "1");
+      return true;
+    })
+    .catch(() => false);
+}
+
 // General rule for any site: a watch page often lists its servers in its code, as other sites'
 // player addresses in its buttons' data attributes (data-link, data-src, data-url, data-embed).
 // The list keeps the page's order, starting with the one already in the player frame.
@@ -597,10 +640,18 @@ async function main() {
     // General rule for any site: a click on a player often opens an ad in a new tab, which takes
     // the front, and Chrome holds back video in a tab that isn't in front. Web tabs opened from the
     // page are closed at once and the item's page comes back to the front (extension pages stay).
+    let following = false;
+    let opened = null;
     browser.on("targetcreated", async (t) => {
       if (t.type() !== "page" || !/^https?:|^about:blank/.test(t.url() || "about:blank") || !t.opener()) return;
       const ad = await t.page().catch(() => null);
       if (!ad || ad === page) return;
+      // While the watch button is being followed, the tab it opens is the watch page: its address
+      // is kept (once it has one) before the tab is closed.
+      if (following) {
+        await until("the opened tab's address", 10_000, async () => /^https?:/.test(ad.url()) || null, 300).catch(() => {});
+        if (/^https?:/.test(ad.url())) opened = ad.url();
+      }
       if (process.env.MDM_SHOTS) fs.appendFileSync(path.join(process.env.MDM_SHOTS, "closed-tabs.txt"), `${ad.url()}\n`);
       await ad.close().catch(() => {});
       await page.bringToFront().catch(() => {});
@@ -609,7 +660,29 @@ async function main() {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await sleep(3000);
     await noteLinks(page, "item");
-    const watch = await watchPageLink(page);
+    let watch = await watchPageLink(page);
+    if (!watch && !(await hasPlayer(page)) && (await markWatchButton(page))) {
+      // The page's own watch button: where it leads (a new tab, this tab, or a player shown here).
+      const before = page.url();
+      following = true;
+      const el = await page.$("[data-mi-watch]");
+      await el?.scrollIntoView().catch(() => {});
+      await el?.click().catch(() => {});
+      log("no player and no watch link: the page's watch button was clicked");
+      await until(
+        "the watch button to lead somewhere",
+        15_000,
+        async () => opened || (page.url().split("#")[0] !== before.split("#")[0] ? page.url() : null) || ((await hasPlayer(page)) ? "here" : null) || (await watchPageLink(page)),
+        500,
+      ).then(
+        (to) => {
+          if (to !== "here" && to !== page.url()) watch = to;
+        },
+        () => log("the watch button led nowhere"),
+      );
+      following = false;
+      await noteLinks(page, "after-watch");
+    }
     if (watch) {
       // The site's own rules for robots (robots.txt, the "*" group) are kept: a watch page it
       // closes to robots is not opened, and the item fails with that reason.
