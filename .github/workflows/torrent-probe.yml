@@ -111,6 +111,10 @@ jobs:
           echo "--- files on disk:"; find "$W/out" -type f -printf '%s %p\n' | sort -rn | head
           F=$(find "$W/out" -type f -regextype posix-extended -iregex '.*\.(mp4|mkv|avi|m4v|webm|mov|mpe?g|ts)$' -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
           [ -n "$F" ] && { ffprobe -v error -show_entries format=duration,size:stream=codec_type,codec_name,width,height -of compact "$F" || true; }
+          [ -n "$F" ] && OKS=$((OKS+1))
+          rm -rf "$W"
+          done
           echo "--- MDM processes left (should be none, no seeding):"; pgrep -af -i misterdownload || echo "(none)"
           echo "--- disk after:"; df -h / "$RUNNER_TEMP"
-          [ -n "$F" ]
+          echo "SUMMARY $OKS of $N downloaded and checked"
+          [ "$OKS" -gt 0 ]
