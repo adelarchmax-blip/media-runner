@@ -12,6 +12,7 @@ import time
 import requests
 
 from poster import poster_thumb, process_poster, work_details
+from sites import hook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 for noisy in ("urllib3", "requests", "PIL"):
@@ -39,17 +40,8 @@ MIN_SECONDS = float(os.environ.get("MIN_SECONDS", "5"))
 MDM_GRAB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mdm", "grab.mjs")
 
 
-def api(path: str, payload: dict) -> dict:
-    for attempt in range(3):
-        try:
-            r = requests.post(f"{API_URL}/{path}", json=payload, timeout=30,
-                              headers={"X-Runner-Token": API_TOKEN})
-            if r.status_code < 500:
-                return r.json() if r.content else {}
-        except (requests.RequestException, ValueError):
-            pass
-        time.sleep(5 * (attempt + 1))
-    return {}
+def api(path: str, payload: dict, timeout: float = 30) -> dict:
+    return hook.call(API_URL, API_TOKEN, path, payload, timeout)
 
 
 def report(item_id: int, status: str, stage: str = "", **extra) -> dict:
@@ -934,16 +926,9 @@ def torrent_lane(count: dict, busy: threading.Event):
 
 
 def restore_sessions():
-    """Sign-ins the owner saved (login.yml) come back on every new runner: Chrome (grab.mjs) and
-    .torrent downloads use them. The file is readable by this user only and is never logged."""
-    sessions = api("miinspact-login", {"op": "sessions"}).get("sessions") or []
-    if not isinstance(sessions, list) or not sessions:
-        return
-    fd = os.open(SESSIONS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(sessions, f)
-    os.environ["MDM_SESSIONS"] = SESSIONS_FILE
-    logging.info(f"{len(sessions)} saved sign-in(s) restored")
+    """Sign-ins come back on every new runner: Chrome (grab.mjs) and .torrent downloads use them."""
+    if hook.save_sessions(api, SESSIONS_FILE):
+        os.environ["MDM_SESSIONS"] = SESSIONS_FILE
 
 
 def main():
