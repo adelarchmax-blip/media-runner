@@ -542,6 +542,17 @@ async function main() {
 
     const before = new Set((await mdmList()).map((d) => d.id));
     const page = await browser.newPage();
+    // General rule for any site: a click on a player often opens an ad in a new tab, which takes
+    // the front, and Chrome holds back video in a tab that isn't in front. Web tabs opened from the
+    // page are closed at once and the item's page comes back to the front (extension pages stay).
+    browser.on("targetcreated", async (t) => {
+      if (t.type() !== "page" || !/^https?:|^about:blank/.test(t.url() || "about:blank") || !t.opener()) return;
+      const ad = await t.page().catch(() => null);
+      if (!ad || ad === page) return;
+      await ad.close().catch(() => {});
+      await page.bringToFront().catch(() => {});
+      log("a tab opened by a click was closed");
+    });
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await sleep(3000);
     const watch = await watchPageLink(page);
