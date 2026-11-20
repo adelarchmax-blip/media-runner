@@ -1,8 +1,9 @@
 #!/bin/bash
 # Installs Mister Download Manager and its official Chromium extension from the project's own
 # GitHub release, checked against the release's SHA256SUMS. MDM fetches its own signed yt-dlp
-# helper for video pages (its "Install yt-dlp" step).
+# helper for video pages (its "Install yt-dlp" step, or install_ytdlp.sh when GitHub's API refuses).
 set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
 VER="${MDM_VERSION:-0.5.2}"
 HOME_DIR="${MDM_HOME:-$HOME/mdm}"
 BASE="https://github.com/anefzaoui/misterdownloadmanager/releases/download/v${VER}"
@@ -21,15 +22,12 @@ unzip -q -o "$EXT" -d "$HOME_DIR/extension"
 MANIFEST=$(find "$HOME_DIR/extension" -name manifest.json -print -quit)
 echo "MDM_EXTENSION=$(dirname "$MANIFEST")" >> "${GITHUB_ENV:-/dev/null}"
 
-# GitHub's API limits shared runner addresses: a few tries, further apart each time.
-# yt-dlp serves watch pages only, so a torrents-only run goes on without it.
-for i in 1 2 3 4 5; do
-  MDM_DATA_DIR="$HOME_DIR/data" misterdownloadmanager-cli install-ytdlp && break
-  if [ "$i" = 5 ]; then
-    [ "${LANES:-all}" = torrents ] || exit 1
-    echo "::warning::yt-dlp helper not installed (GitHub rate limit); torrents-only run goes on without it"
-    break
-  fi
-  sleep $((i * 20))
-done
+# yt-dlp: MDM's own install first; GitHub's API limits shared runner addresses, so when it
+# refuses, the same verified install without the API (install_ytdlp.sh). yt-dlp serves watch
+# pages only, so a torrents-only run goes on without it.
+if ! MDM_DATA_DIR="$HOME_DIR/data" misterdownloadmanager-cli install-ytdlp \
+  && ! bash "$HERE/install_ytdlp.sh" "$HOME_DIR/data"; then
+  [ "${LANES:-all}" = torrents ] || exit 1
+  echo "::warning::yt-dlp helper not installed; torrents-only run goes on without it"
+fi
 echo "MDM $VER ready"
