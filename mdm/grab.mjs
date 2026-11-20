@@ -32,6 +32,29 @@ const RETYPE_MS = 15_000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (msg) => console.error(`[grab] ${msg}`);
 
+// Probe runs only (MDM_SHOTS): what the page offers to watch or download, and its frames, kept in
+// a file beside the screenshots (never in the log, which is public).
+async function noteLinks(page, name) {
+  if (!process.env.MDM_SHOTS) return;
+  const seen = await page
+    .evaluate(() => {
+      const box = (e) => {
+        const r = e.getBoundingClientRect();
+        return [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
+      };
+      const attrs = (e) => Object.fromEntries([...e.attributes].filter((a) => a.name !== "style").map((a) => [a.name, a.value.slice(0, 300)]));
+      const want = /مشاهد|شاهد|تحميل|سيرفر|watch|play|download|server/i;
+      const links = [...document.querySelectorAll("a,button,[onclick],[data-link],[data-src],[data-url]")]
+        .filter((e) => want.test((e.textContent || "").trim().slice(0, 60) + " " + (e.className || "") + " " + (e.getAttribute("href") || "")))
+        .slice(0, 80)
+        .map((e) => ({ tag: e.tagName, text: (e.textContent || "").trim().slice(0, 60), box: box(e), attrs: attrs(e) }));
+      const frames = [...document.querySelectorAll("iframe")].map((f) => ({ box: box(f), src: (f.src || "").slice(0, 300) }));
+      return { url: location.href, links, frames };
+    })
+    .catch((e) => ({ error: String(e) }));
+  fs.writeFileSync(path.join(process.env.MDM_SHOTS, `${name}.json`), JSON.stringify(seen, null, 1));
+}
+
 async function until(what, ms, fn, every = 500) {
   const end = Date.now() + ms;
   for (;;) {
@@ -578,12 +601,14 @@ async function main() {
       if (t.type() !== "page" || !/^https?:|^about:blank/.test(t.url() || "about:blank") || !t.opener()) return;
       const ad = await t.page().catch(() => null);
       if (!ad || ad === page) return;
+      if (process.env.MDM_SHOTS) fs.appendFileSync(path.join(process.env.MDM_SHOTS, "closed-tabs.txt"), `${ad.url()}\n`);
       await ad.close().catch(() => {});
       await page.bringToFront().catch(() => {});
       log("a tab opened by a click was closed");
     });
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await sleep(3000);
+    await noteLinks(page, "item");
     const watch = await watchPageLink(page);
     if (watch) {
       // The site's own rules for robots (robots.txt, the "*" group) are kept: a watch page it
@@ -728,6 +753,7 @@ async function main() {
   } catch (e) {
     const page = browser && (await browser.pages().catch(() => []))[1];
     if (page && process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, "failed.png") }).catch(() => {});
+    if (page) await noteLinks(page, "failed");
     throw e;
   } finally {
     if (browser) await browser.close().catch(() => {});
