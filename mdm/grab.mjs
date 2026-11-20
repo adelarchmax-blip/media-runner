@@ -684,6 +684,12 @@ async function main() {
 
     const before = new Set((await mdmList()).map((d) => d.id));
     const page = await browser.newPage();
+    // Probe runs keep the requests that failed or were refused (any frame): why a player stays empty.
+    if (process.env.MDM_SHOTS) {
+      const net = (line) => fs.appendFileSync(path.join(process.env.MDM_SHOTS, "net.txt"), line.slice(0, 300) + "\n");
+      page.on("requestfailed", (r) => net(`failed ${r.resourceType()} ${r.failure()?.errorText} ${r.url()}`));
+      page.on("response", (r) => r.status() >= 400 && net(`${r.status()} ${r.request().resourceType()} ${r.url()}`));
+    }
     // General rule for any site: a click on a player often opens an ad in a new tab, which takes
     // the front, and Chrome holds back video in a tab that isn't in front. Web tabs opened from the
     // page are closed at once and the item's page comes back to the front (extension pages stay).
@@ -754,6 +760,7 @@ async function main() {
     const servers = await serverLinks(page);
     if (servers.length) log(`${servers.length} servers listed in the page's code`);
     let server = 0;
+    const failed = new Map();
     let since = Date.now();
     const v = await until(
       "the page's video",
@@ -770,11 +777,17 @@ async function main() {
         if (box) return box;
         // No video 30 s after a server came up (5 s when it refused): the next listed server.
         const refused = await playerRefused(page);
-        if (servers.length > server + 1 && Date.now() - since > (refused ? 5_000 : 30_000)) {
+        if (servers.length > 1 && Date.now() - since > (refused ? 5_000 : 30_000)) {
           if (refused) log(`server ${server + 1} refused to open in the page`);
           // Probe runs keep what each server showed before it was left.
           if (process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, `server-${server + 1}.png`) }).catch(() => {});
-          server += 1;
+          // A host whose two servers showed nothing usually fails on all of them (it blocks the
+          // runner or asks for a check): its other servers are skipped.
+          const host = (u) => new URL(u).hostname.replace(/^www\./, "");
+          failed.set(host(servers[server]), (failed.get(host(servers[server])) || 0) + 1);
+          const next = servers.findIndex((u, i) => i > server && (failed.get(host(u)) || 0) < 2);
+          if (next < 0) throw Object.assign(new Error(`no video on any of the page's ${servers.length} servers`), { fatal: true });
+          server = next;
           since = Date.now();
           await useServer(page, servers[server]);
           log(`server ${server + 1} of ${servers.length}: ${new URL(servers[server]).hostname}`);
