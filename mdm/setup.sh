@@ -22,9 +22,14 @@ MANIFEST=$(find "$HOME_DIR/extension" -name manifest.json -print -quit)
 echo "MDM_EXTENSION=$(dirname "$MANIFEST")" >> "${GITHUB_ENV:-/dev/null}"
 
 # GitHub's API limits shared runner addresses: a few tries, further apart each time.
+# yt-dlp serves watch pages only, so a torrents-only run goes on without it.
 for i in 1 2 3 4 5; do
   MDM_DATA_DIR="$HOME_DIR/data" misterdownloadmanager-cli install-ytdlp && break
-  [ "$i" = 5 ] && exit 1
+  if [ "$i" = 5 ]; then
+    [ "${LANES:-all}" = torrents ] || exit 1
+    echo "::warning::yt-dlp helper not installed (GitHub rate limit); torrents-only run goes on without it"
+    break
+  fi
   sleep $((i * 20))
 done
 echo "MDM $VER ready"
