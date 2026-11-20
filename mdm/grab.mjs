@@ -576,6 +576,8 @@ async function main() {
         const refused = await playerRefused(page);
         if (servers.length > server + 1 && Date.now() - since > (refused ? 5_000 : 30_000)) {
           if (refused) log(`server ${server + 1} refused to open in the page`);
+          // Probe runs keep what each server showed before it was left.
+          if (process.env.MDM_SHOTS) await page.screenshot({ path: path.join(process.env.MDM_SHOTS, `server-${server + 1}.png`) }).catch(() => {});
           server += 1;
           since = Date.now();
           await useServer(page, servers[server]);
