@@ -1,0 +1,56 @@
+name: library-fix
+
+# One-off repair of files already in the library: MP4s whose index sits at the end get it moved to
+# the front (streams copied, nothing re-encoded), so playback starts at once. Files already fine are
+# only peeked at, never downloaded. The log shows counters only.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Stop taking new files after this many minutes"
+        required: false
+        default: "300"
+
+concurrency:
+  group: library-fix
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install tools
+        run: |
+          need=""; for c in ffmpeg rclone; do command -v $c >/dev/null || need="$need $c"; done
+          if [ -n "$need" ]; then
+            sudo rm -f /var/lib/man-db/auto-update
+            sudo apt-get install -y -qq --no-install-recommends $need > /dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $need > /dev/null; }
+          fi
+          pip install -q -r requirements.txt
+
+      - name: Configure rclone
+        env:
+          RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG_BASE64 }}
+        run: python setup_rclone.py
+
+      - name: Move each index to the front
+        env:
+          RCLONE_REMOTE: ${{ secrets.RCLONE_REMOTE }}
+          MEDIA_BASE_PATH: ${{ secrets.MEDIA_BASE_PATH }}
+          MAX_MINUTES: ${{ inputs.minutes }}
+        run: |
+          case "$MAX_MINUTES" in ''|*[!0-9]*) MAX_MINUTES=300 ;; esac
+          [ "$MAX_MINUTES" -le 320 ] || MAX_MINUTES=320
+          export MAX_MINUTES
+          python library_faststart.py

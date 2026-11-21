@@ -794,30 +794,41 @@ def verify_video(path: str) -> str:
 def moov_after_mdat(path: str) -> bool:
     """True when an MP4/MOV keeps its index (`moov`) after the media data (`mdat`): a player then has
     to fetch the end of the file before it can start, which is slow from a cloud drive."""
-    seen_mdat = False
     try:
         with open(path, "rb") as f:
             size = os.fstat(f.fileno()).st_size
-            pos = 0
-            for _ in range(64):
-                if pos + 8 > size:
-                    break
+
+            def read(pos, n):
                 f.seek(pos)
-                head = f.read(16)
-                box_len, kind = int.from_bytes(head[:4], "big"), head[4:8]
-                if box_len == 1 and len(head) >= 16:
-                    box_len = int.from_bytes(head[8:16], "big")
-                elif box_len == 0:
-                    box_len = size - pos
-                if box_len < 8:
-                    break
-                if kind == b"moov":
-                    return seen_mdat
-                if kind == b"mdat":
-                    seen_mdat = True
-                pos += box_len
+                return f.read(n)
+            return index_after_media(read, size)
     except OSError:
-        pass
+        return False
+
+
+def index_after_media(read, size: int) -> bool:
+    """Walks the top-level boxes with read(position, count) -> bytes (a local file or a remote range)."""
+    seen_mdat, pos = False, 0
+    for _ in range(64):
+        if pos + 8 > size:
+            break
+        head = read(pos, 16)
+        if len(head) < 8:
+            break
+        box_len, kind = int.from_bytes(head[:4], "big"), head[4:8]
+        if box_len == 1:
+            if len(head) < 16:
+                break
+            box_len = int.from_bytes(head[8:16], "big")
+        elif box_len == 0:
+            box_len = size - pos
+        if box_len < 8:
+            break
+        if kind == b"moov":
+            return seen_mdat
+        if kind == b"mdat":
+            seen_mdat = True
+        pos += box_len
     return False
 
 

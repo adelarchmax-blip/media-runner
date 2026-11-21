@@ -152,3 +152,46 @@ def test_mp4_index_moves_to_the_front_and_bad_files_stay_untouched(tmp_path, mon
         broken.write_bytes(junk)
         assert worker.moov_after_mdat(str(broken)) is False
     assert worker.moov_after_mdat(str(tmp_path / "missing.mp4")) is False
+
+
+def test_library_repair_decides_from_remote_ranges_and_never_breaks_a_file(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    import pytest
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg missing")
+    import library_faststart as L
+    slow = tmp_path / "slow.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=8:s=320x240", "-c:v", "mpeg4", str(slow)], check=True)
+    data = slow.read_bytes()
+    assert worker.index_after_media(lambda pos, n: data[pos:pos + n], len(data))
+    assert not worker.index_after_media(lambda pos, n: b"", len(data))          # remote read failed: leave it
+    remote = {"lib/a.mp4": data}
+    monkeypatch.setattr(L, "WORK", str(tmp_path / "work"))
+    monkeypatch.setattr(L.worker, "WORK_DIR", str(tmp_path))
+    monkeypatch.setattr(L, "remote_read", lambda path: (lambda pos, n: remote[path][pos:pos + n]))
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["rclone", "copyto"] and cmd[2].startswith(L.worker.REMOTE + ":"):
+            with open(cmd[3], "wb") as f:
+                f.write(remote[cmd[2].split(":", 1)[1]])
+        elif cmd[:2] == ["rclone", "copyto"]:
+            with open(cmd[2], "rb") as f:
+                remote[cmd[3].split(":", 1)[1]] = f.read()
+        else:
+            return real_run(cmd, **kw)
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+    real_run = subprocess.run
+    monkeypatch.setattr(L.subprocess, "run", fake_run)
+    assert L.fix_one("lib/a.mp4", len(data)) == "fixed"
+    fixed = remote["lib/a.mp4"]
+    assert not worker.index_after_media(lambda pos, n: fixed[pos:pos + n], len(fixed))
+    assert L.fix_one("lib/a.mp4", len(fixed)) == "fine"
+    remote["lib/b.mp4"] = data[: len(data) // 2] + data[-4000:]           # damaged copy: never uploaded back
+    if worker.index_after_media(lambda pos, n: remote["lib/b.mp4"][pos:pos + n], len(remote["lib/b.mp4"])):
+        before = remote["lib/b.mp4"]
+        assert L.fix_one("lib/b.mp4", len(before)) == "failed" and remote["lib/b.mp4"] == before
+    monkeypatch.setattr(L, "DEADLINE", 0)
+    remote["lib/c.mp4"] = data
+    assert L.fix_one("lib/c.mp4", len(data)) == "skipped" and remote["lib/c.mp4"] == data
+    assert not os.path.exists(L.WORK)
