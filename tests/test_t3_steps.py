@@ -113,7 +113,7 @@ def test_stopped_item_is_not_reported_as_failed(tmp_path, monkeypatch):
     reports = []
     monkeypatch.setattr(worker, "WORK_DIR", str(tmp_path))
     monkeypatch.setattr(worker, "report", lambda *a, **k: reports.append((a, k)) or {"stop": True})
-    monkeypatch.setattr(worker, "process_poster", lambda *a, **k: False)
+    monkeypatch.setattr(worker, "process_poster", lambda *a, **k: "")
     monkeypatch.setattr(worker, "work_details", lambda *a, **k: {})
     monkeypatch.setattr(worker, "destination", lambda item: ("f", "b", "f"))
     worker.process({"id": 7, "kind": "torrent", "clean_title": "x"})

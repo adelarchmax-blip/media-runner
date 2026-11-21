@@ -158,7 +158,7 @@ def test_no_time_left(fake_mdm, monkeypatch):
 
 def test_process_torrent_item_uploads_video_then_subtitles(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "WORK_DIR", str(tmp_path / "work"))
-    monkeypatch.setattr(worker, "process_poster", lambda *a, **k: False)
+    monkeypatch.setattr(worker, "process_poster", lambda *a, **k: "")
     monkeypatch.setattr(worker, "work_details", lambda *a, **k: {})
     reports, copies = [], []
     monkeypatch.setattr(worker, "report", lambda item_id, status, **k: reports.append((status, k)))
@@ -414,3 +414,107 @@ def test_direct_web_source_failing_falls_back_to_torrent(fake_mdm, monkeypatch):
     assert video == base + ".mp4" and calls.exists()
     assert json.loads((tmp / "args.json").read_text())[1] == "torrent-get"
     assert not os.listdir(os.path.join(os.path.dirname(base), "torrent", "direct"))   # failed tries leave nothing
+
+
+def test_telegram_lane_runs_as_many_videos_as_the_account_allows(monkeypatch):
+    """Premium account: 3 videos at once; it keeps asking while the other lanes still run, then the account closes."""
+    import threading
+    monkeypatch.setattr(worker, "EMPTY_RECHECK", 0.1)
+    queue = [{"id": i, "kind": "telegram"} for i in range(1, 8)]
+    lock, running, closed = threading.Lock(), {"now": 0, "max": 0}, []
+    others = threading.Event()
+    others.set()
+
+    class Account:
+        def slots(self):
+            return 3
+    monkeypatch.setattr(worker.telegram, "client", lambda: Account())
+    monkeypatch.setattr(worker.telegram, "close", lambda: closed.append(1))
+
+    def next_items(kind, n, tag):
+        assert kind == "telegram" and n <= 3
+        with lock:
+            got, queue[:] = queue[:n], queue[n:]
+        if not got:
+            others.clear()                  # the other lanes are done: nothing more will come
+        return got
+
+    def process(item):
+        with lock:
+            running["now"] += 1
+            running["max"] = max(running["max"], running["now"])
+        worker.time.sleep(0.15)
+        with lock:
+            running["now"] -= 1
+    monkeypatch.setattr(worker, "next_items", next_items)
+    monkeypatch.setattr(worker, "process", process)
+    count = {"pages": 0, "torrents": 0, "telegram": 0}
+    worker.telegram_lane(count, others)
+    assert count["telegram"] == 7 and running["max"] == 3 and closed == [1]
+
+
+def test_telegram_lane_without_the_account_ends_quietly(monkeypatch):
+    import threading
+    closed = []
+
+    def broken():
+        raise PermissionError("signed out")
+    monkeypatch.setattr(worker.telegram, "client", broken)
+    monkeypatch.setattr(worker.telegram, "close", lambda: closed.append(1))
+    worker.telegram_lane({"telegram": 0}, threading.Event())
+    assert closed == [1]
+
+
+def test_download_starts_while_the_poster_is_still_looked_up(tmp_path, monkeypatch):
+    """The poster search no longer delays the download; the upload waits for it a little, then goes on."""
+    import threading
+    monkeypatch.setattr(worker, "WORK_DIR", str(tmp_path / "work"))
+    release, order, reports = threading.Event(), [], []
+
+    def slow_poster(src, local, **k):
+        release.wait(5)
+        order.append("poster")
+        with open(local, "wb") as fh:
+            fh.write(b"jpg")
+        return "real"
+    monkeypatch.setattr(worker, "process_poster", slow_poster)
+    monkeypatch.setattr(worker, "poster_thumb", lambda p: "thumb")
+    monkeypatch.setattr(worker, "work_details", lambda *a, **k: {"summary": "s"})
+    monkeypatch.setattr(worker, "remote_exists", lambda p: False)
+    monkeypatch.setattr(worker, "report", lambda item_id, status, **k: reports.append((status, k)))
+
+    def fake_torrent(item, out_base, progress):
+        order.append("download")
+        release.set()
+        v = out_base + ".mp4"
+        with open(v, "wb") as fh:
+            fh.write(b"v")
+        return v, []
+    monkeypatch.setattr(worker, "download_torrent", fake_torrent)
+    monkeypatch.setattr(worker, "verify_video", lambda p: p)
+    monkeypatch.setattr(worker, "upload", lambda local, remote, progress: order.append("upload") or 5.0)
+
+    class Done:
+        returncode = 0
+    monkeypatch.setattr(worker.subprocess, "run", lambda cmd, **k: order.append("poster_up") or Done())
+    worker.process({"id": 7, "kind": "torrent", "clean_title": "Film", "year": 1940, "content_type": "movie",
+                    "section_path": "Movies/Foreign_Movies", "watch_url": MAGNET})
+    assert order == ["download", "poster", "poster_up", "upload"]
+    assert any(k.get("details") == {"summary": "s", "poster_thumb": "thumb"} for _s, k in reports)
+    assert reports[-1][0] == "uploaded"
+
+
+def test_a_late_poster_does_not_report_after_the_item_ended(tmp_path, monkeypatch):
+    import threading
+    monkeypatch.setattr(worker, "WORK_DIR", str(tmp_path / "work"))
+    monkeypatch.setattr(worker, "ART_WAIT", 0.1)
+    release, reports = threading.Event(), []
+    monkeypatch.setattr(worker, "process_poster", lambda *a, **k: release.wait(5) and "")
+    monkeypatch.setattr(worker, "work_details", lambda *a, **k: {})
+    monkeypatch.setattr(worker, "report", lambda item_id, status, **k: reports.append(status))
+    monkeypatch.setattr(worker, "download_torrent", lambda *a: (_ for _ in ()).throw(RuntimeError("torrent dead")))
+    worker.process({"id": 8, "kind": "torrent", "clean_title": "F", "year": 1940, "content_type": "movie",
+                    "section_path": "Movies/Foreign_Movies", "watch_url": MAGNET})
+    release.set()
+    worker.time.sleep(0.3)
+    assert reports[-1] == "failed" and reports.count("failed") == 1 and "downloading" not in reports[reports.index("failed"):]

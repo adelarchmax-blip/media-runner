@@ -146,25 +146,35 @@ def test_join_by_invite_and_by_name():
 
 
 class DownloadClient(FakeClient):
-    def __init__(self, stop_at=None):
-        super().__init__([], {(88, 4): doc_msg(4)})
-        self.stop_at = stop_at
+    """Hands out each piece of a made-up file; the bytes say where they came from, so a wrong place shows"""
+    def __init__(self, size=10 * 1024 + 300):
+        super().__init__([], {(88, 4): doc_msg(4, size=size)})
+        self.asked, self.body = [], bytes(i % 251 for i in range(min(size, 64 * 1024)))
 
-    async def download_media(self, msg, file, progress_callback):
-        for done in (100, 200, 300):
-            progress_callback(done, 300)
-        with open(file, "wb") as f:
-            f.write(b"x")
-        return file
+    async def iter_download(self, document, offset, request_size, limit, file_size):
+        self.asked.append((offset, limit))
+        for n in range(limit):
+            start = offset + n * request_size
+            if start >= file_size:
+                return
+            await asyncio.sleep(0)
+            yield self.body[start:start + request_size]
 
 
-def test_download_size_progress_and_stop(tmp_path):
+def test_download_in_pieces_at_once_progress_and_stop(tmp_path, monkeypatch):
+    monkeypatch.setattr(TG, "CHUNK", 1024)
     t = TG.Telegram()
     t._client = DownloadClient()
     seen = []
-    assert asyncio.run(t._size("chan_one", 4)) == 900 * 1048576
+    assert asyncio.run(t._size("chan_one", 4)) == 10 * 1024 + 300
     path = asyncio.run(t._download("chan_one", 4, str(tmp_path / "film"), lambda d, total: seen.append(d)))
-    assert path.endswith("film.mkv") and seen == [100, 200, 300]
+    assert path.endswith("film.mkv") and (tmp_path / "film.mkv").read_bytes() == t._client.body
+    assert sorted(t._client.asked) == [(0, 3), (3072, 3), (6144, 3), (9216, 2)]   # 4 pieces (free account)
+    assert seen[-1] == 10 * 1024 + 300 and seen == sorted(seen)
+
+    t._premium, t._client = True, DownloadClient()
+    asyncio.run(t._download("chan_one", 4, str(tmp_path / "film_p"), lambda d, total: None))
+    assert len(t._client.asked) == 6            # Premium: up to 8 pieces (11 chunks -> 6 pieces of 2)
 
     class Stopped(Exception):
         pass
@@ -173,6 +183,40 @@ def test_download_size_progress_and_stop(tmp_path):
         raise Stopped()
     with pytest.raises(Stopped):
         asyncio.run(t._download("chan_one", 4, str(tmp_path / "film2"), stop))
+    t._premium, t._client = False, DownloadClient(size=2100 * 1048576)
+    with pytest.raises(ValueError):             # bigger than a free account may download
+        asyncio.run(t._download("chan_one", 4, str(tmp_path / "big"), lambda d, total: None))
+
+
+def test_download_that_comes_back_short_is_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(TG, "CHUNK", 1024)
+    t = TG.Telegram()
+    t._client = DownloadClient()
+
+    async def short(document, offset, request_size, limit, file_size):
+        yield b"x" * 10
+    t._client.iter_download = short
+    with pytest.raises(IOError):
+        asyncio.run(t._download("chan_one", 4, str(tmp_path / "f"), lambda d, total: None))
+
+
+def test_post_picture_full_size(tmp_path):
+    t = TG.Telegram()
+    t._client = FakeClient([], {(88, 7): text_msg(7, "poster", photo=True), (88, 8): text_msg(8, "no picture")})
+
+    async def media(msg, file):
+        assert file is bytes
+        return b"\xff\xd8jpeg"
+    t._client.download_media = media
+    assert asyncio.run(t._picture("chan_one", 7, str(tmp_path / "p.jpg"))) is True
+    assert (tmp_path / "p.jpg").read_bytes() == b"\xff\xd8jpeg"
+    assert asyncio.run(t._picture("chan_one", 8, str(tmp_path / "q.jpg"))) is False
+    assert asyncio.run(t._picture("chan_one", 99, str(tmp_path / "r.jpg"))) is False
+
+
+def test_old_checks_of_size_and_links():
+    t = TG.Telegram()
+    t._client = DownloadClient()
     with pytest.raises(FileNotFoundError):
         asyncio.run(t._size("chan_one", 99))
     for bad in ("tg:bad name/1", "magnet:?x", "tg:chan_one/", None):

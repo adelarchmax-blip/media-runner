@@ -26,6 +26,11 @@ MAX_TEXT = 1500
 MAX_LINKED = 40              # message links opened in one scan
 SCAN_MAX = 1000
 STALL = 5 * 60               # a download with no new bytes for this long has stopped
+CHUNK = 512 * 1024           # the biggest piece Telegram hands out in one request
+PARTS = {True: 8, False: 4}  # pieces downloaded at the same time: Premium account / free account
+MAX_FILE = {True: 4000 * 1048576, False: 2000 * 1048576}   # the largest file Telegram allows each account
+SLOTS = {True: 3, False: 2}  # videos downloaded at the same time: Premium account / free account
+POSTER_MAX = 10 * 1048576    # a post picture at full size
 USER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 INVITE_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 MSG_LINK = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:(c)/(\d{4,20})|([A-Za-z][A-Za-z0-9_]{3,31}))/(\d{1,9})(?![\w/])", re.I)
@@ -84,6 +89,7 @@ class Telegram:
         self._thread = None
         self._lock = threading.Lock()
         self._dialogs = False
+        self._premium = False
 
     def _call(self, coro_fn, timeout):
         with self._lock:
@@ -115,6 +121,10 @@ class Telegram:
         if not await client.is_user_authorized():
             await client.disconnect()
             raise PermissionError("telegram session signed out")
+        me = await client.get_me()
+        self._premium = bool(getattr(me, "premium", False))
+        logging.info(f"telegram account: {'Premium' if self._premium else 'free'}, "
+                     f"{SLOTS[self._premium]} videos x {PARTS[self._premium]} pieces at a time, files up to {MAX_FILE[self._premium] // 1048576} MB")
         self._client = client
 
     def close(self):
@@ -347,23 +357,71 @@ class Telegram:
         return self._call(lambda: self._download(peer, msg_id, out_base, on_progress), timeout)
 
     async def _download(self, peer, msg_id, out_base, on_progress):
+        """Several pieces of the file at the same time (as many as the account allows), each written in its place"""
         msg = await self._client.get_messages(await self._entity(peer), ids=msg_id)
         if not msg or not video_facts(msg, peer):
             raise FileNotFoundError("the video is gone")
+        total = int(msg.file.size or 0)
+        if total <= 0 or total > MAX_FILE[self._premium]:
+            raise ValueError("the video is bigger than this account may download")
         ext = (msg.file.ext or "") if VIDEO_EXT.search(msg.file.ext or "") else ".mp4"
+        path = out_base + ext
+        chunks = -(-total // CHUNK)
+        parts = max(1, min(PARTS[self._premium], chunks))
+        per = -(-chunks // parts)
         last = {"at": time.time(), "bytes": 0}
+        with open(path, "wb") as f:
+            f.truncate(total)
 
-        def progress(done, total):
-            if done > last["bytes"]:
-                last["at"], last["bytes"] = time.time(), done
-            on_progress(done, total)        # "stop" from the owner raises here: the download ends at once
-        task = asyncio.ensure_future(self._client.download_media(msg, file=out_base + ext, progress_callback=progress))
-        while not task.done():
-            await asyncio.wait({task}, timeout=30)
-            if not task.done() and time.time() - last["at"] > STALL:
-                task.cancel()
-                raise TimeoutError("telegram download stalled")
-        return task.result()
+        async def piece(first):
+            count = min(per, chunks - first)
+            with open(path, "r+b") as f:
+                f.seek(first * CHUNK)
+                async for data in self._client.iter_download(msg.document, offset=first * CHUNK, request_size=CHUNK,
+                                                             limit=count, file_size=total):
+                    f.write(data)
+                    last["bytes"] += len(data)
+                    last["at"] = time.time()
+                    on_progress(min(last["bytes"], total), total)   # "stop" from the owner raises here: all pieces end
+
+        tasks = [asyncio.ensure_future(piece(first)) for first in range(0, chunks, per)]
+        try:
+            while True:
+                done, pending = await asyncio.wait(tasks, timeout=30, return_when=asyncio.FIRST_EXCEPTION)
+                failed = next((t for t in done if not t.cancelled() and t.exception()), None)
+                if failed:
+                    raise failed.exception()
+                if not pending:
+                    break
+                if time.time() - last["at"] > STALL:
+                    raise TimeoutError("telegram download stalled")
+        finally:
+            for t in tasks:
+                t.cancel()
+        if last["bytes"] != total:
+            raise IOError("telegram download incomplete")
+        return path
+
+    def slots(self) -> int:
+        """How many videos this account downloads at once (connects first, to learn whether it is Premium)"""
+        self._call(lambda: asyncio.sleep(0), 2 * 60)
+        return SLOTS[self._premium]
+
+    def picture(self, link: str, path: str) -> bool:
+        """`tg:<channel>/<message>` -> the post picture at its full size, for the poster"""
+        peer, msg_id = self._link(link)
+        return self._call(lambda: self._picture(peer, msg_id, path), 3 * 60)
+
+    async def _picture(self, peer, msg_id, path):
+        msg = await self._client.get_messages(await self._entity(peer), ids=msg_id)
+        if not msg or not getattr(msg, "photo", None):
+            return False
+        data = await self._client.download_media(msg, file=bytes)
+        if not isinstance(data, bytes) or not 0 < len(data) <= POSTER_MAX:
+            return False
+        with open(path, "wb") as f:
+            f.write(data)
+        return True
 
 
 _client = None

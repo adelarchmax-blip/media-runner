@@ -116,6 +116,13 @@ class Progress:
         self.stage = "item_details"    # each item its own stage: torrents run side by side
         self.stopped = False
         self.procs = []                # this item's running commands, stopped at once on "stop"
+        self.lock = threading.Lock()   # the poster lookup reports only while the item is still running
+        self.done = False
+        self.poster = ""               # "real" or "text" (written, no picture found) once the poster is ready
+
+    def finish(self):
+        with self.lock:
+            self.done = True
 
     def push(self, force: bool = False, **extra):
         if force or time.time() - self.last >= REPORT_INTERVAL:
@@ -789,6 +796,23 @@ def remote_exists(remote_path: str) -> bool:
     return r.returncode == 0 and bool(r.stdout.strip())
 
 
+POSTER_MARK = "poster.text"   # next to a written poster (no picture was found): a real picture replaces it later
+
+
+def put_poster(local: str, folder: str, kind: str) -> None:
+    """The work's poster goes up once. A written one leaves a mark, so a later episode or copy that has a
+    real picture replaces it; a real picture is never replaced."""
+    poster, mark = f"{folder}/poster.jpg", f"{folder}/{POSTER_MARK}"
+    there = remote_exists(poster)
+    if there and not (kind == "real" and remote_exists(mark)):
+        return
+    subprocess.run(["rclone", "copyto", local, f"{REMOTE}:{poster}"], check=True, capture_output=True)
+    if kind == "text":
+        subprocess.run(["rclone", "touch", f"{REMOTE}:{mark}"], capture_output=True)
+    elif there:
+        subprocess.run(["rclone", "deletefile", f"{REMOTE}:{mark}"], capture_output=True)
+
+
 def upload(local: str, remote_path: str, progress: Progress) -> float:
     """رفع بملف واحد مع قراءة نسبة التقدم من إحصائيات rclone (JSON)"""
     started = time.time()
@@ -812,6 +836,27 @@ def upload(local: str, remote_path: str, progress: Progress) -> float:
     return os.path.getsize(local) / 1048576 / max(1.0, time.time() - started)
 
 
+ART_WAIT = 120          # seconds the upload waits, at most, for a poster still being looked up
+
+
+def prepare_art(item: dict, job_dir: str, local_poster: str, progress: Progress):
+    """The poster and the work's details, side by side with the download (the dashboard shows them as they come)."""
+    title, year = item.get("clean_title", ""), item.get("year")
+    try:
+        has_poster = process_poster(poster_source(item, job_dir), local_poster, title=title, year=year)
+        if not has_poster and os.path.exists(local_poster):
+            os.remove(local_poster)
+        progress.poster = has_poster or ""
+        details = {**work_details(title, year), "poster_thumb": poster_thumb(local_poster) if has_poster else ""}
+        with progress.lock:
+            if progress.done:
+                return
+            report(progress.item_id, "downloading", stage=progress.stage, dl_pct=progress.dl_pct,
+                   speed_mbs=round(progress.speed, 2), size_mb=round(progress.size_mb, 1), details=details)
+    except Exception as e:      # no poster or details: the video still goes up
+        logging.warning(f"item {progress.item_id}: no details ({type(e).__name__})")
+
+
 def process(item: dict):
     item_id = int(item["id"])
     job_dir = os.path.join(WORK_DIR, str(item_id))
@@ -820,19 +865,17 @@ def process(item: dict):
     try:
         folder, base_name, poster_folder = destination(item)
         progress.push(force=True)
-        # The poster and the work's details first, so the dashboard shows what is downloading.
+        # The poster and the work's details are looked up while the video downloads: the download starts at once.
         local_poster = os.path.join(job_dir, "poster.jpg")
-        title, year = item.get("clean_title", ""), item.get("year")
-        has_poster = process_poster(item.get("poster_url") or "", local_poster, title=title, year=year)
-        try:
-            details = {**work_details(title, year), "poster_thumb": poster_thumb(local_poster) if has_poster else ""}
-            progress.push(force=True, details=details)
-        except Exception as e:
-            logging.warning(f"item {item_id}: no details ({type(e).__name__})")
+        art = threading.Thread(target=prepare_art, args=(item, job_dir, local_poster, progress), daemon=True)
+        art.start()
         progress.stage = "item_download"
         progress.push(force=True)
         fetch = {"torrent": download_torrent, "telegram": download_telegram}.get(item.get("kind"), download)
         video, subtitles = fetch(item, os.path.join(job_dir, base_name), progress)
+        art.join(ART_WAIT)
+        has_poster = not art.is_alive() and os.path.isfile(local_poster) and os.path.getsize(local_poster) > 0 \
+            and progress.poster
         progress.stage = "item_verify"
         video = verify_video(video)
         progress.dl_pct = 100
@@ -840,10 +883,8 @@ def process(item: dict):
         progress.push(force=True, ul_pct=0)
 
         # البوستر: للمسلسل في مجلد المسلسل نفسه (مرة واحدة)، وللفيلم/المسرحية في مجلده
-        poster_remote = f"{poster_folder}/poster.jpg"
-        if has_poster and not remote_exists(poster_remote):
-            subprocess.run(["rclone", "copyto", local_poster, f"{REMOTE}:{poster_remote}"],
-                           check=True, capture_output=True)
+        if has_poster:
+            put_poster(local_poster, poster_folder, progress.poster)
 
         progress.stage = "item_upload"
         progress.push(force=True)
@@ -854,14 +895,17 @@ def process(item: dict):
             r = subprocess.run(["rclone", "copyto", local, f"{REMOTE}:{folder}/{name}"], capture_output=True)
             if r.returncode != 0:
                 logging.warning(f"item {item_id}: a subtitle file was not uploaded")
+        progress.finish()
         report(item_id, "uploaded", stage=progress.stage, dl_pct=100, ul_pct=100, size_mb=round(progress.size_mb, 1),
                speed_mbs=round(speed, 2), gdrive_path=remote_video)
         logging.info(f"item {item_id}: uploaded ({progress.size_mb:.0f} MB)")
     except Stopped:
+        progress.finish()
         logging.info(f"item {item_id}: stopped by the owner, its files are removed")
         if item.get("kind") in (None, "page"):
             stop_leftover_mdm()
     except Exception as e:
+        progress.finish()
         if progress.stopped:      # a command cut by "stop" fails on its own: not a real failure
             logging.info(f"item {item_id}: stopped by the owner, its files are removed")
             return
@@ -873,6 +917,19 @@ def process(item: dict):
 
 
 # ---------- telegram (the account's own session, no browser) ----------
+
+def poster_source(item: dict, job_dir: str) -> str:
+    """The poster address; a Telegram post picture (`tg:<channel>/<message>`) is saved first at its full size"""
+    source = item.get("poster_url") or ""
+    if not source.startswith("tg:"):
+        return source
+    path = os.path.join(job_dir, "post_picture.jpg")
+    try:
+        return path if telegram.client().picture(source, path) else ""
+    except Exception as e:      # no picture: the poster search by title is next
+        logging.info(f"telegram post picture: {type(e).__name__}")
+        return ""
+
 
 def download_telegram(item: dict, out_base: str, progress: Progress) -> tuple:
     """فيديو واحد من رسالة في قناة تليجرام، بحساب المالك اللي في خزنة جيت هب"""
@@ -912,51 +969,49 @@ def page_lane(count: dict, torrents_busy: threading.Event):
             count["pages"] += 1
 
 
-def torrent_lane(count: dict, busy: threading.Event):
-    """A rolling batch of TORRENT_SLOTS torrents: the moment one ends (done, failed or dead), its slot
-    takes the next one, so the batch never waits for its slowest torrent."""
+def rolling_lane(kind: str, slots: int, tag: str, count: dict, keep_waiting=lambda: False):
+    """A rolling batch of `slots` items: the moment one ends (done, failed or dead), its slot takes the
+    next one, so the batch never waits for its slowest item. keep_waiting(): ask again later when empty."""
     active, ended = {}, threading.Event()
     asked_empty_at = 0.0
+    key = {"torrent": "torrents"}.get(kind, kind)
 
     def one(item):
         try:
             process(item)
         finally:
-            count["torrents"] += 1
+            count[key] += 1
             ended.set()
+    while True:
+        for k in [k for k, t in active.items() if not t.is_alive()]:
+            del active[k]
+        free = slots - len(active)
+        if free and time_left() and time.time() - asked_empty_at >= EMPTY_RECHECK:
+            items = next_items(kind, free, f"{tag}{count[key]}-{len(active)}")
+            asked_empty_at = 0.0 if items else time.time()
+            for item in items:
+                t = threading.Thread(target=one, args=(item,), daemon=True)
+                active[item["id"]] = t
+                t.start()
+        if not active and ((asked_empty_at and not keep_waiting()) or not time_left()):
+            return
+        ended.wait(EMPTY_RECHECK)
+        ended.clear()
+
+
+def torrent_lane(count: dict, busy: threading.Event):
     try:
-        while True:
-            for k in [k for k, t in active.items() if not t.is_alive()]:
-                del active[k]
-            free = TORRENT_SLOTS - len(active)
-            if free and time_left() and time.time() - asked_empty_at >= EMPTY_RECHECK:
-                items = next_items("torrent", free, f"t{count['torrents']}-{len(active)}")
-                asked_empty_at = 0.0 if items else time.time()
-                for item in items:
-                    t = threading.Thread(target=one, args=(item,), daemon=True)
-                    active[item["id"]] = t
-                    t.start()
-            if not active and (asked_empty_at or not time_left()):
-                return
-            ended.wait(EMPTY_RECHECK)
-            ended.clear()
+        rolling_lane("torrent", TORRENT_SLOTS, "t", count)
     finally:
         busy.clear()
 
 
 def telegram_lane(count: dict, others_busy: threading.Event):
-    """Telegram videos one after another (one account, so one download at a time)."""
+    """Telegram videos, as many at once as the account's kind allows (Premium more than a free one)."""
     try:
-        while time_left():
-            items = next_items("telegram", 1, f"g{count['telegram']}")
-            if not items:
-                if not others_busy.is_set():
-                    return
-                time.sleep(EMPTY_RECHECK)
-                continue
-            for item in items:
-                process(item)
-                count["telegram"] += 1
+        rolling_lane("telegram", telegram.client().slots(), "g", count, others_busy.is_set)
+    except Exception as e:      # the account could not be reached: its items wait for the next run
+        logging.info(f"telegram lane: {type(e).__name__}")
     finally:
         telegram.close()
 

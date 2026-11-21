@@ -23,6 +23,11 @@ WORKERS = 4
 MAX_ITEMS = 60
 MAX_PARTS = 40
 FILM_TYPES = {"Q11424", "Q24869", "Q202866", "Q506240", "Q229390", "Q1259759", "Q17517379", "Q24862"}
+TV_TYPES = {"Q5398426", "Q1259759", "Q526877", "Q581714"}
+# Arabic works: original language Arabic (or a spoken Arabic), or made in an Arab country when the language is not given
+ARABIC_LANGS = {"Q13955", "Q29919"}
+ARAB_COUNTRIES = {"Q79", "Q851", "Q858", "Q822", "Q810", "Q796", "Q817", "Q878", "Q1028", "Q262", "Q948", "Q1016",
+                  "Q1049", "Q219060", "Q846", "Q398", "Q842", "Q805"}
 _QID = re.compile(r"^Q\d{1,12}$")
 _ARABIC = re.compile(r"[؀-ۿ]")
 
@@ -56,7 +61,10 @@ def series(title: str, year: int = None, http=requests) -> dict:
     show = next((s for s in shows if year and _year(s.get("premiered")) == year), None) or \
         next((s for s in shows if _near(_year(s.get("premiered")), year)), None)
     if not show or not isinstance(show.get("id"), int):
-        return {}
+        # not on TVmaze (many Arabic series are not): Wikidata may still know it is Arabic and its Arabic name
+        ar = "" if _ARABIC.search(title) else _series_ar_name(title, year, http)
+        return {"kind": "series", "title": title[:200], "year": year, "poster": None, "seasons": {},
+                "source": "Wikidata", "arabic": True, "ar_title": ar} if ar else {}
     episodes = _get(f"{TVMAZE}/shows/{show['id']}/episodes", {}, http) or []
     seasons = {}
     for e in episodes:
@@ -64,8 +72,41 @@ def series(title: str, year: int = None, http=requests) -> dict:
                 and 0 < e["season"] < 200 and 0 < e["number"] < 2000:
             seasons[str(e["season"])] = max(seasons.get(str(e["season"]), 0), e["number"])
     image = show.get("image") if isinstance(show.get("image"), dict) else {}
-    return {"kind": "series", "title": str(show.get("name") or "")[:200], "year": _year(show.get("premiered")),
-            "poster": _https(image.get("original") or image.get("medium")), "seasons": seasons, "source": "TVmaze"}
+    out = {"kind": "series", "title": str(show.get("name") or "")[:200], "year": _year(show.get("premiered")),
+           "poster": _https(image.get("original") or image.get("medium")), "seasons": seasons, "source": "TVmaze"}
+    if show.get("language") == "Arabic":
+        ar = title.strip()[:200] if _ARABIC.search(title) else _series_ar_name(out["title"], out["year"], http)
+        out.update(arabic=True, **({"ar_title": ar} if ar else {}))
+    return out
+
+
+def _series_ar_name(name: str, year: int = None, http=requests) -> str:
+    """TVmaze writes Arabic series in Latin letters: their Arabic name comes from Wikidata (an Arabic TV series
+    of the same year), or stays unknown. Never a translation or a Latin spelling."""
+    if not name:
+        return ""
+    found = _get(WIKIDATA, {"action": "wbsearchentities", "search": name, "language": "en", "uselang": "en",
+                            "type": "item", "limit": 7, "format": "json"}, http) or {}
+    ids = [s["id"] for s in found.get("search") or [] if isinstance(s, dict) and _QID.match(str(s.get("id")))]
+    if not ids:
+        return ""
+    data = _get(WIKIDATA, {"action": "wbgetentities", "ids": "|".join(ids), "props": "claims|labels",
+                           "languages": "ar|en|mul", "format": "json"}, http) or {}
+    entities = data.get("entities") or {}
+
+    def plain(t):
+        return re.sub(r"[\W_]+", "", str(t or "").lower())
+    for i in ids:
+        e = entities.get(i)
+        if not (isinstance(e, dict) and TV_TYPES & set(_claims(e, "P31")) and _is_arabic(e)):
+            continue
+        started = min((_year(d) for d in _claims(e, "P580") + _claims(e, "P577") if _year(d)), default=None)
+        labels = e.get("labels") or {}
+        en = (labels.get("en") or labels.get("mul") or {}).get("value")
+        # the same series: the same name in a near year, or (spelled differently) the very same year
+        if (plain(en) == plain(name) and _near(started, year)) or (year and started == year):
+            return _ar_label(e)
+    return ""
 
 
 # ---------- movie: Wikidata ----------
@@ -83,9 +124,23 @@ def _claims(entity: dict, prop: str) -> list:
     return out
 
 
-def _label(entity: dict) -> str:
+def _is_arabic(entity: dict) -> bool:
+    langs = set(_claims(entity, "P364"))
+    return bool(langs & ARABIC_LANGS) or (not langs and bool(set(_claims(entity, "P495")) & ARAB_COUNTRIES))
+
+
+def _ar_label(entity: dict) -> str:
+    """The Arabic name exactly as the database writes it (never a translation or a Latin spelling)."""
+    label = (entity.get("labels") or {}).get("ar")
+    value = str(label.get("value") or "")[:200] if isinstance(label, dict) else ""
+    return value if _ARABIC.search(value) else ""
+
+
+def _label(entity: dict, arabic: bool = False) -> str:
+    """An Arabic work goes by its Arabic name; a foreign one by its original name (English, or Wikidata's
+    shared "mul" label that many items now carry instead of an English one)."""
     labels = entity.get("labels") or {}
-    for lang in ("ar", "en"):
+    for lang in (("ar", "en", "mul") if arabic else ("en", "mul", "ar")):
         if isinstance(labels.get(lang), dict):
             return str(labels[lang].get("value") or "")[:200]
     return ""
@@ -99,10 +154,10 @@ def _poster(entity: dict):
     return COMMONS + urllib.parse.quote(name.replace(" ", "_")) + "?width=500"
 
 
-def _parts(series_id: str, http=requests) -> list:
+def _parts(series_id: str, http=requests, arabic: bool = False) -> list:
     query = f"""SELECT ?f ?fLabel (MIN(?d) AS ?date) (SAMPLE(?o) AS ?ord) WHERE {{
       ?f p:P179 ?st . ?st ps:P179 wd:{series_id} . OPTIONAL {{ ?st pq:P1545 ?o }} OPTIONAL {{ ?f wdt:P577 ?d }}
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "ar,en" }} }} GROUP BY ?f ?fLabel LIMIT {MAX_PARTS}"""
+      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{'ar,en,mul' if arabic else 'en,mul,ar'}" }} }} GROUP BY ?f ?fLabel LIMIT {MAX_PARTS}"""
     data = _get(SPARQL, {"query": query, "format": "json"}, http) or {}
     parts = []
     for b in (data.get("results") or {}).get("bindings") or []:
@@ -123,7 +178,7 @@ def movie(title: str, year: int = None, http=requests) -> dict:
     if not ids:
         return {}
     data = _get(WIKIDATA, {"action": "wbgetentities", "ids": "|".join(ids), "props": "claims|labels",
-                           "languages": "ar|en", "format": "json"}, http) or {}
+                           "languages": "ar|en|mul", "format": "json"}, http) or {}
     entities = data.get("entities") or {}
     film = next((entities[i] for i in ids if isinstance(entities.get(i), dict)
                  and FILM_TYPES & set(_claims(entities[i], "P31"))
@@ -131,16 +186,21 @@ def movie(title: str, year: int = None, http=requests) -> dict:
                 None)
     if not film:
         return {}
-    out = {"kind": "movie", "title": _label(film) or title[:200],
+    arabic = _is_arabic(film)
+    out = {"kind": "movie", "title": _label(film, arabic) or title[:200],
            "year": min((_year(d) for d in _claims(film, "P577") if _year(d)), default=None),
            "poster": _poster(film), "source": "Wikidata"}
+    if arabic:
+        ar = _ar_label(film) or (title.strip()[:200] if _ARABIC.search(title) else "")
+        out.update(arabic=True, **({"ar_title": ar} if ar else {}))
     series_ids = [s for s in _claims(film, "P179") if _QID.match(str(s))]
     if series_ids:
         names = _get(WIKIDATA, {"action": "wbgetentities", "ids": series_ids[0], "props": "labels",
-                                "languages": "ar|en", "format": "json"}, http) or {}
-        parts = _parts(series_ids[0], http)
+                                "languages": "ar|en|mul", "format": "json"}, http) or {}
+        parts = _parts(series_ids[0], http, arabic)
         if len(parts) > 1:
-            out["collection"] = {"name": _label((names.get("entities") or {}).get(series_ids[0]) or {}), "parts": parts}
+            out["collection"] = {"name": _label((names.get("entities") or {}).get(series_ids[0]) or {}, arabic),
+                                 "parts": parts}
     return out
 
 

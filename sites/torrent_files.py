@@ -184,12 +184,3 @@ def parse_magnet(text: str) -> dict:
             "trackers": _urls(params.get("tr", []), _TRACKER, MAX_TRACKERS),
             "web_seeds": _urls(params.get("ws", []), _SEED, MAX_SEEDS)}
 
-
-def build_magnet(t: dict) -> str:
-    parts = [("xt", "urn:btih:" + t["btih"])]
-    if t.get("name"):
-        parts.append(("dn", t["name"]))
-    if t.get("size_bytes"):
-        parts.append(("xl", str(t["size_bytes"])))
-    parts += [("tr", u) for u in t.get("trackers", [])] + [("ws", u) for u in t.get("web_seeds", [])]
-    return "magnet:?" + "&".join(f"{k}={urllib.parse.quote(v, safe=':/')}" for k, v in parts)

@@ -431,6 +431,15 @@ def _download_image(url: str, portrait: bool = False):
     return None
 
 
+def _open_local(path: str):
+    try:
+        img = Image.open(path)
+        img.load()
+        return img if img.size[0] >= MIN_SOURCE_WIDTH else None
+    except Exception:
+        return None
+
+
 def _query_variants(title: str) -> list:
     """Search forms: the whole title, its Latin part alone, its Arabic part alone."""
     variants = [title]
@@ -486,6 +495,10 @@ def find_best_poster(source: str, title: str, year: int = None):
         img = _download_image(imdb_high_res(source))
         if img:
             return img
+    elif source and os.path.isfile(source):      # the post picture, already saved next to the job
+        img = _open_local(source)
+        if img:
+            return img
     seen = set()
     for q in _query_variants(title or ""):
         for url in _encyclopedia_posters(q, year):
@@ -515,14 +528,17 @@ def find_best_poster(source: str, title: str, year: int = None):
     return None
 
 
-def process_poster(source: str, output_path: str, title: str = "", year: int = None) -> bool:
-    """بوستر Jellyfin: أفضل صورة متاحة، مطبّعة لـ 2:3 كاملة بلا قص أو مط، خفيفة الحجم"""
+def process_poster(source: str, output_path: str, title: str = "", year: int = None) -> str:
+    """بوستر Jellyfin: أفضل صورة متاحة، مطبّعة لـ 2:3 كاملة بلا قص أو مط، خفيفة الحجم.
+    بيرجع "real" لصورة حقيقية، و"text" للبوستر المكتوب (مفيش صورة)، و"" لو مااتعملش"""
     try:
-        img = find_best_poster(source, title, year) or create_fallback_poster(title, year)
-        return compress_and_save_poster(normalize_poster_dimensions(img), output_path)
+        img, kind = find_best_poster(source, title, year), "real"
+        if img is None:
+            img, kind = create_fallback_poster(title, year), "text"
+        return kind if compress_and_save_poster(normalize_poster_dimensions(img), output_path) else ""
     except Exception as e:
         logging.error(f"poster processing failed ({type(e).__name__})")
-        return False
+        return ""
 
 
 if __name__ == "__main__":

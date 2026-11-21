@@ -15,6 +15,7 @@ Kinds:
   life             whether anyone shares queued torrents            -> sites.health.check (no browser)
   page_info        a page added by hand: its real title and poster  -> sites.explorer.page_identity
   title_info       posters, seasons, film series (free databases)   -> sites.title_info.lookup (no browser)
+  poster_search    a cover for titles that still have none           -> sites.poster_search.search (IMDb, then Google/Bing Images in Chrome)
   tg_scan          one Telegram channel's new messages               -> sites.telegram (no browser)
   tg_join          joining a private Telegram channel from its invite -> sites.telegram (no browser)
   tg_folder        the channels in one of the account's chat folders  -> sites.telegram (no browser)
@@ -32,7 +33,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-from sites import explorer, health, telegram, title_info, torrent_files, torrent_scan, watch
+from sites import explorer, health, poster_search, telegram, title_info, torrent_files, torrent_scan, watch
 
 HOOK = "miinspact-site"
 MAX_MINUTES = 330              # the run's own limit (sites.yml stops at 340)
@@ -40,7 +41,7 @@ IDLE_MINUTES = 10              # waiting for new jobs after the last one
 POLL = 30                      # seconds between questions while waiting
 BEAT = 60                      # seconds between heartbeats
 PARALLEL = 3                   # sites read at the same time (one tab each)
-BROWSER_KINDS = ("torrent_scan", "torrent_search", "torrent_explore", "watch_explore", "watch_crawl", "page_info")
+BROWSER_KINDS = ("torrent_scan", "torrent_search", "torrent_explore", "watch_explore", "watch_crawl", "page_info", "poster_search")
 LIGHT_KINDS = ("life", "title_info")
 TG_KINDS = ("tg_scan", "tg_join", "tg_folder", "tg_photos")
 
@@ -130,6 +131,8 @@ class _Run:
                         result = watch.explore(work, tab.fetch)
                     elif kind == "page_info":
                         result = _page_info(work, tab.fetch)
+                    elif kind == "poster_search":
+                        result = poster_search.search(work, tab.fetch)
                     else:
                         result = {"profile": torrent_scan.explore(work, tab.fetch)}
             else:

@@ -29,7 +29,6 @@ DEADLINE = 7                # seconds for one torrent's whole check
 MAX_ASKED = 6               # trackers asked per torrent (the first ones listed)
 MAX_BODY = 64 * 1024
 WORKERS = 24                # torrents checked at the same time
-DEAD_NOTE = "ميت: مفيش حد بيشاركه"
 _UDP_MAGIC = 0x41727101980
 
 
