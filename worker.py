@@ -788,6 +788,58 @@ def verify_video(path: str) -> str:
         logging.info(f"  rewritten with its duration ({secs / 60:.0f} min)")
     if secs < MIN_SECONDS:
         raise RuntimeError("duration too short")
+    return make_faststart(path, secs)
+
+
+def moov_after_mdat(path: str) -> bool:
+    """True when an MP4/MOV keeps its index (`moov`) after the media data (`mdat`): a player then has
+    to fetch the end of the file before it can start, which is slow from a cloud drive."""
+    seen_mdat = False
+    try:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            pos = 0
+            for _ in range(64):
+                if pos + 8 > size:
+                    break
+                f.seek(pos)
+                head = f.read(16)
+                box_len, kind = int.from_bytes(head[:4], "big"), head[4:8]
+                if box_len == 1 and len(head) >= 16:
+                    box_len = int.from_bytes(head[8:16], "big")
+                elif box_len == 0:
+                    box_len = size - pos
+                if box_len < 8:
+                    break
+                if kind == b"moov":
+                    return seen_mdat
+                if kind == b"mdat":
+                    seen_mdat = True
+                pos += box_len
+    except OSError:
+        pass
+    return False
+
+
+def make_faststart(path: str, secs: float) -> str:
+    """Moves the MP4 index to the front (streams copied, nothing re-encoded), so playback starts at
+    once. Any failure keeps the original file untouched."""
+    if os.path.splitext(path)[1].lower() not in (".mp4", ".m4v", ".mov") or not moov_after_mdat(path):
+        return path
+    tmp = path + ".fast" + os.path.splitext(path)[1]
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-map", "0", "-c", "copy", "-movflags", "+faststart", tmp],
+                           capture_output=True, text=True, timeout=1800)
+        new_secs = video_seconds(tmp) if r.returncode == 0 and os.path.exists(tmp) else 0.0
+        if new_secs and abs(new_secs - secs) <= max(2.0, secs * 0.01) and not moov_after_mdat(tmp):
+            os.replace(tmp, path)
+            logging.info("  index moved to the front (fast start)")
+            return path
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    logging.warning("  fast start skipped, original kept")
     return path
 
 

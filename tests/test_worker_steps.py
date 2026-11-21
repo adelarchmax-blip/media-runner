@@ -126,3 +126,29 @@ def test_a_real_picture_is_not_unwrapped(tmp_path):
     pic.write_bytes(FAKE_PNG + b"tail that is not a video")
     assert worker.unwrap_image_segments(str(pic)) is None
     assert pic.exists()
+
+
+def test_mp4_index_moves_to_the_front_and_bad_files_stay_untouched(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    import pytest
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg missing")
+    monkeypatch.setattr(worker, "MIN_VIDEO_BYTES", 1000)
+    slow = str(tmp_path / "slow.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=8:s=320x240", "-c:v", "mpeg4", slow], check=True)
+    assert worker.moov_after_mdat(slow)                      # ffmpeg's default: index at the end
+    assert worker.verify_video(slow) == slow
+    assert not worker.moov_after_mdat(slow) and 7.5 < worker.video_seconds(slow) < 8.5
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["slow.mp4"]
+    before = os.path.getmtime(slow)
+    assert worker.make_faststart(slow, 8.0) == slow and os.path.getmtime(slow) == before   # already fast: untouched
+    broken = tmp_path / "broken.mp4"
+    broken.write_bytes(b"\x00\x00\x00\x10mdat" + b"x" * 8 + b"\x00\x00\x00\x10moov" + b"y" * 8)
+    assert worker.moov_after_mdat(str(broken))
+    assert worker.make_faststart(str(broken), 8.0) == str(broken) and broken.read_bytes().endswith(b"y" * 8)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["broken.mp4", "slow.mp4"]
+    for junk in (b"", b"\x00\x00\x00\x00", b"\x00\x00\x00\x01mdat\x00\x00\x00\x00\x00\x00\x00\x00"):
+        broken.write_bytes(junk)
+        assert worker.moov_after_mdat(str(broken)) is False
+    assert worker.moov_after_mdat(str(tmp_path / "missing.mp4")) is False
