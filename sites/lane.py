@@ -17,6 +17,8 @@ Kinds:
   title_info       posters, seasons, film series (free databases)   -> sites.title_info.lookup (no browser)
   tg_scan          one Telegram channel's new messages               -> sites.telegram (no browser)
   tg_join          joining a private Telegram channel from its invite -> sites.telegram (no browser)
+  tg_folder        the channels in one of the account's chat folders  -> sites.telegram (no browser)
+  tg_photos        small pictures of the posts kept as films           -> sites.telegram (no browser)
 Telegram jobs are asked for only when the account is set up (the `telegram` secrets), one at a time.
 Up to PARALLEL sites are read side by side while the light jobs (no browser) run beside them. Chrome starts only when a
 job needs it. With nothing left, the runner waits IDLE_MINUTES for new jobs before it ends, so a job added
@@ -40,7 +42,7 @@ BEAT = 60                      # seconds between heartbeats
 PARALLEL = 3                   # sites read at the same time (one tab each)
 BROWSER_KINDS = ("torrent_scan", "torrent_search", "torrent_explore", "watch_explore", "watch_crawl", "page_info")
 LIGHT_KINDS = ("life", "title_info")
-TG_KINDS = ("tg_scan", "tg_join")
+TG_KINDS = ("tg_scan", "tg_join", "tg_folder", "tg_photos")
 
 
 def _page_info(work: dict, fetch) -> dict:
@@ -111,6 +113,10 @@ class _Run:
                 result = telegram.client().scan(work)
             elif kind == "tg_join":
                 result = telegram.client().join(work)
+            elif kind == "tg_folder":
+                result = telegram.client().folder(work)
+            elif kind == "tg_photos":
+                result = telegram.client().photos(work)
             elif kind in BROWSER_KINDS:
                 with chrome.tab() as tab:
                     if kind in ("torrent_scan", "torrent_search"):

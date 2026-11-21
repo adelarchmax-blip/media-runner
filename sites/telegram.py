@@ -1,5 +1,6 @@
-"""Telegram on the runner: reading channels (tg_scan), joining one from its invite (tg_join), downloading
-one video (worker.py, kind "telegram").
+"""Telegram on the runner: reading channels (tg_scan), joining one from its invite (tg_join), the channels
+in one of the account's chat folders (tg_folder), small pictures of posts (tg_photos), downloading one
+video (worker.py, kind "telegram").
 
 The account's session and app keys come only from three environment variables that the workflow gives
 to the one step that runs Python, from the GitHub secrets of the `telegram` environment. They are taken
@@ -12,6 +13,7 @@ described: text, photo, video facts (name, size, length, height) and the links i
 A link to a message in another channel is opened so its video is described too.
 """
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -27,6 +29,9 @@ STALL = 5 * 60               # a download with no new bytes for this long has st
 USER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 INVITE_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 MSG_LINK = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(?:(c)/(\d{4,20})|([A-Za-z][A-Za-z0-9_]{3,31}))/(\d{1,9})(?![\w/])", re.I)
+PHOTO_MAX = 200 * 1024      # one post picture (about 320 px wide)
+PHOTOS_MAX = 30             # pictures in one job
+FOLDER_MAX = 300            # channels taken from one folder
 VIDEO_EXT = re.compile(r"\.(mp4|mkv|avi|m4v|webm|mov|mpe?g|ts|wmv)$", re.I)
 
 
@@ -76,6 +81,7 @@ class Telegram:
     def __init__(self):
         self._loop = None
         self._client = None
+        self._thread = None
         self._lock = threading.Lock()
         self._dialogs = False
 
@@ -83,12 +89,12 @@ class Telegram:
         with self._lock:
             if self._client is None:
                 self._loop = asyncio.new_event_loop()
-                threading.Thread(target=self._loop.run_forever, daemon=True, name="tg").start()
+                self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="tg")
+                self._thread.start()
                 try:
                     asyncio.run_coroutine_threadsafe(self._connect(), self._loop).result(120)
                 except BaseException:
-                    self._loop.call_soon_threadsafe(self._loop.stop)
-                    self._loop = None
+                    self._end_loop()
                     raise
         future = asyncio.run_coroutine_threadsafe(coro_fn(), self._loop)
         try:
@@ -114,12 +120,26 @@ class Telegram:
     def close(self):
         with self._lock:
             if self._client is not None:
+                client = self._client
+
+                async def bye():          # awaited on the client's own loop (called elsewhere it returns nothing)
+                    await client.disconnect()
                 try:   # disconnect only: the session stays valid for the next run
-                    asyncio.run_coroutine_threadsafe(self._client.disconnect(), self._loop).result(30)
+                    asyncio.run_coroutine_threadsafe(bye(), self._loop).result(30)
                 except Exception as e:
                     logging.info(f"telegram close: {type(e).__name__}")
-                self._loop.call_soon_threadsafe(self._loop.stop)
-            self._client, self._loop, self._dialogs = None, None, False
+            if self._loop is not None:
+                self._end_loop()
+            self._client, self._dialogs = None, False
+
+    def _end_loop(self):
+        """The loop stops, its thread ends, and it is closed (no open sockets left behind)"""
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(10)
+        if not self._loop.is_running():
+            self._loop.close()
+        self._loop, self._thread = None, None
 
     async def _entity(self, peer):
         from telethon.tl.types import PeerChannel
@@ -160,13 +180,24 @@ class Telegram:
                              "linked": await self._linked(" ".join([m.message or ""] + links), opened),
                              "links": links})
         out = {"messages": messages, "more": more, "last_id": last,
-               "channel": {"id": int(entity.id), "title": str(getattr(entity, "title", "") or "")[:120]}}
+               "channel": {"id": int(entity.id), "title": str(getattr(entity, "title", "") or "")[:120],
+                           "restricted": bool(getattr(entity, "restricted", False))}}
         if work.get("about"):
             try:
                 full = await self._client(functions.channels.GetFullChannelRequest(entity))
                 out["channel"]["about"] = str(full.full_chat.about or "")[:500]
+                members = getattr(full.full_chat, "participants_count", None)
+                if isinstance(members, int):
+                    out["channel"]["members"] = members
             except Exception as e:
                 logging.info(f"telegram about: {type(e).__name__}")
+        if work.get("photo"):
+            try:                        # the channel's small picture (160 px)
+                pic = await self._client.download_profile_photo(entity, file=bytes, download_big=False)
+                if isinstance(pic, bytes) and 0 < len(pic) <= PHOTO_MAX:
+                    out["channel"]["photo"] = base64.b64encode(pic).decode()
+            except Exception as e:
+                logging.info(f"telegram photo: {type(e).__name__}")
         logging.info(f"telegram scan: {len(messages)} message(s), more={more}, {opened['n']} link(s) opened")
         return out
 
@@ -217,6 +248,78 @@ class Telegram:
         logging.info("telegram: joined a channel")
         return {"id": int(chat.id), "title": str(getattr(chat, "title", "") or "")[:120],
                 "username": getattr(chat, "username", None)}
+
+    # ---------- a chat folder ----------
+
+    def folder(self, work: dict) -> dict:
+        return self._call(lambda: self._folder(work), 10 * 60)
+
+    @staticmethod
+    def _plain(text) -> str:
+        """A folder name without emoji, spaces or the alef/yeh/teh-marbuta spellings, to compare names"""
+        t = str(getattr(text, "text", text) or "").casefold()
+        t = re.sub("[إأآ]", "ا", t).replace("ى", "ي").replace("ة", "ه")
+        return re.sub(r"[^\w]", "", t)
+
+    async def _folder(self, work):
+        from telethon import functions
+        want = self._plain(work.get("name"))
+        if not want or len(want) > 64:
+            raise ValueError("bad folder name")
+        res = await self._client(functions.messages.GetDialogFiltersRequest())
+        found = None
+        for f in getattr(res, "filters", res) or []:
+            if self._plain(getattr(f, "title", "")) == want:
+                found = f
+                break
+        if found is None:
+            logging.info("telegram folder: not found")
+            return {"found": False, "channels": []}
+        out = []
+        for peer in (list(getattr(found, "pinned_peers", None) or []) + list(getattr(found, "include_peers", None) or []))[:FOLDER_MAX]:
+            if type(peer).__name__ != "InputPeerChannel":
+                continue                # people, bots and small groups are not channels
+            try:
+                chat = await self._client.get_entity(peer)
+            except Exception as e:
+                logging.info(f"telegram folder channel: {type(e).__name__}")
+                continue
+            name = getattr(chat, "username", None)
+            out.append({"id": int(chat.id), "title": str(getattr(chat, "title", "") or "")[:120],
+                        "username": name if isinstance(name, str) and USER_RE.match(name) else None})
+        logging.info(f"telegram folder: {len(out)} channel(s)")
+        return {"found": True, "channels": out}
+
+    # ---------- post pictures ----------
+
+    def photos(self, work: dict) -> dict:
+        return self._call(lambda: self._photos(work), 10 * 60)
+
+    @staticmethod
+    def _middle_size(msg):
+        """The picture size closest to 320 px wide: the poster of the post, or the video's own cover"""
+        sizes = list(getattr(getattr(msg, "photo", None), "sizes", None) or []) or \
+            list(getattr(getattr(msg, "document", None), "thumbs", None) or [])
+        sized = [s for s in sizes if isinstance(getattr(s, "w", None), int) and type(s).__name__ in ("PhotoSize", "PhotoSizeProgressive")]
+        return min(sized, key=lambda s: abs(s.w - 320)) if sized else None
+
+    async def _photos(self, work):
+        out = []
+        for want in (work.get("items") or [])[:PHOTOS_MAX]:
+            peer, msg_id = want.get("peer") if isinstance(want, dict) else None, want.get("msg") if isinstance(want, dict) else None
+            if not isinstance(msg_id, int) or isinstance(msg_id, bool) or msg_id <= 0:
+                continue
+            try:
+                msg = await self._client.get_messages(await self._entity(peer), ids=msg_id)
+                size = self._middle_size(msg) if msg else None
+                pic = await self._client.download_media(msg, file=bytes, thumb=size) if size else None
+            except Exception as e:
+                logging.info(f"telegram picture: {type(e).__name__}")
+                continue
+            if isinstance(pic, bytes) and 0 < len(pic) <= PHOTO_MAX:
+                out.append({"peer": peer, "msg": msg_id, "jpg": base64.b64encode(pic).decode()})
+        logging.info(f"telegram pictures: {len(out)} of {len(work.get('items') or [])}")
+        return {"photos": out}
 
     # ---------- downloading ----------
 

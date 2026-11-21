@@ -123,7 +123,7 @@ def test_scan_describes_messages_opens_linked_videos_and_says_more():
     assert out["messages"][2]["grouped_id"] == 9 and out["messages"][1]["videos"][0]["peer"] == "mainchan"
     assert [v["peer"] for v in out["messages"][4]["linked"]] == [5551234]       # the closed channel is skipped
     assert ("dialogs",) in t._client.calls
-    assert out["channel"] == {"id": 77, "title": "Main", "about": "films"}
+    assert out["channel"] == {"id": 77, "title": "Main", "about": "films", "restricted": False}
     again = asyncio.run(t._scan({"channel": "mainchan", "since_id": 6, "limit": 5}))
     assert [m["id"] for m in again["messages"]] == [7] and again["more"] is False and again["last_id"] == 7 and "about" not in again["channel"]
     only_service = asyncio.run(t._scan({"channel": "mainchan", "since_id": 4, "limit": 1}))
@@ -204,3 +204,87 @@ def test_lane_asks_telegram_jobs_only_when_set_up(monkeypatch):
     done = {a["id"]: a for a in answers if a["op"] == "done"}
     assert done[1]["result"]["more"] is False and done[2]["error"] == "PermissionError"
     assert "tg_scan" in asks[0] and Client.closed
+
+
+def test_scan_brings_the_channel_picture_members_and_restriction():
+    t = fake([text_msg(1, "x")])
+
+    async def picture(entity, file, download_big):
+        assert file is bytes and download_big is False
+        return b"\xff\xd8jpeg"
+    t._client.download_profile_photo = picture
+
+    async def full(request):
+        return pytypes.SimpleNamespace(full_chat=pytypes.SimpleNamespace(about="", participants_count=1234))
+    FakeClient.__call__, keep = (lambda self, r: full(r)), FakeClient.__call__
+    try:
+        out = asyncio.run(t._scan({"channel": "mainchan", "about": True, "photo": True}))
+    finally:
+        FakeClient.__call__ = keep
+    assert out["channel"]["members"] == 1234 and out["channel"]["restricted"] is False
+    assert TG.base64.b64decode(out["channel"]["photo"]) == b"\xff\xd8jpeg"
+    plain = asyncio.run(fake([text_msg(1, "x")])._scan({"channel": "mainchan"}))
+    assert "photo" not in plain["channel"] and "members" not in plain["channel"]
+
+
+def test_folder_lists_its_channels_by_a_loose_name():
+    t = fake()
+    chan = types.InputPeerChannel(channel_id=5, access_hash=1)
+    folders = pytypes.SimpleNamespace(filters=[
+        types.DialogFilterDefault(),
+        pytypes.SimpleNamespace(title=pytypes.SimpleNamespace(text="🎬 أفلام"), pinned_peers=[chan],
+                                include_peers=[types.InputPeerUser(user_id=3, access_hash=1), types.InputPeerChannel(channel_id=6, access_hash=1)])])
+
+    async def call(request):
+        assert type(request).__name__ == "GetDialogFiltersRequest"
+        return folders
+
+    async def entity(peer):
+        if peer.channel_id == 6:
+            raise ValueError("gone")
+        return pytypes.SimpleNamespace(id=peer.channel_id, title="Films", username="films_hd")
+    t._client.get_entity = entity
+    keep = FakeClient.__call__
+    FakeClient.__call__ = lambda self, r: call(r)
+    try:
+        out = asyncio.run(t._folder({"name": "افلام"}))
+        none = asyncio.run(t._folder({"name": "مسلسلات"}))
+    finally:
+        FakeClient.__call__ = keep
+    assert out == {"found": True, "channels": [{"id": 5, "title": "Films", "username": "films_hd"}]}
+    assert none == {"found": False, "channels": []}
+    with pytest.raises(ValueError):
+        asyncio.run(t._folder({"name": "🎬"}))
+
+
+def test_post_pictures_pick_the_middle_size_and_skip_the_broken():
+    small = types.PhotoSize(type="s", w=90, h=90, size=100)
+    mid = types.PhotoSize(type="m", w=320, h=480, size=9000)
+    big = types.PhotoSize(type="x", w=800, h=1200, size=90000)
+    photo_msg = pytypes.SimpleNamespace(photo=pytypes.SimpleNamespace(sizes=[small, big, mid]), document=None)
+    video_msg = pytypes.SimpleNamespace(photo=None, document=pytypes.SimpleNamespace(thumbs=[small]))
+    t = fake(others={(77, 10): photo_msg, (77, 11): video_msg})
+    got = []
+
+    async def media(msg, file, thumb):
+        got.append(thumb)
+        return b"\xff\xd8" + bytes(10)
+    t._client.download_media = media
+    out = asyncio.run(t._photos({"items": [{"peer": "mainchan", "msg": 10}, {"peer": "mainchan", "msg": 11},
+                                           {"peer": "mainchan", "msg": 12}, {"peer": "bad name!", "msg": 1}, {"msg": True}]}))
+    assert got == [mid, small] and [p["msg"] for p in out["photos"]] == [10, 11]
+
+
+def test_close_waits_for_the_disconnect_on_the_clients_own_loop():
+    t = TG.Telegram()
+    done = []
+
+    class Client:
+        async def disconnect(self):
+            done.append(asyncio.get_running_loop() is t._loop)
+    t._loop = loop = asyncio.new_event_loop()
+    t._thread = TG.threading.Thread(target=t._loop.run_forever, daemon=True)
+    t._thread.start()
+    t._client = Client()
+    t.close()
+    assert done == [True] and t._client is None and t._loop is None and loop.is_closed()
