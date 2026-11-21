@@ -167,8 +167,8 @@ def test_library_repair_decides_from_remote_ranges_and_never_breaks_a_file(tmp_p
     assert worker.index_after_media(lambda pos, n: data[pos:pos + n], len(data))
     assert not worker.index_after_media(lambda pos, n: b"", len(data))          # remote read failed: leave it
     remote = {"lib/a.mp4": data}
-    monkeypatch.setattr(L, "WORK", str(tmp_path / "work"))
-    monkeypatch.setattr(L.worker, "WORK_DIR", str(tmp_path))
+    monkeypatch.setattr(L, "WORK", str(tmp_path / "not-made-yet" / "library"))
+    monkeypatch.setattr(L.worker, "WORK_DIR", str(tmp_path / "not-made-yet"))      # a fresh runner has no work folder
     monkeypatch.setattr(L, "remote_read", lambda path: (lambda pos, n: remote[path][pos:pos + n]))
 
     def fake_run(cmd, **kw):

@@ -45,6 +45,7 @@ def fix_one(path: str, size: int) -> str:
     checked file of the same length in time."""
     if not worker.index_after_media(remote_read(path), size):
         return "fine"
+    os.makedirs(worker.WORK_DIR, exist_ok=True)
     if time.time() > DEADLINE or shutil.disk_usage(worker.WORK_DIR).free < size * 2.2:
         return "skipped"
     shutil.rmtree(WORK, ignore_errors=True)
