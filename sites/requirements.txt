@@ -3,3 +3,5 @@ requests==2.32.3
 beautifulsoup4==4.13.4
 playwright==1.55.0
 lxml==6.0.0
+telethon==1.45.0
+cryptg==0.6.0

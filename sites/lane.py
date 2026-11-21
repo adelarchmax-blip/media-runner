@@ -15,6 +15,9 @@ Kinds:
   life             whether anyone shares queued torrents            -> sites.health.check (no browser)
   page_info        a page added by hand: its real title and poster  -> sites.explorer.page_identity
   title_info       posters, seasons, film series (free databases)   -> sites.title_info.lookup (no browser)
+  tg_scan          one Telegram channel's new messages               -> sites.telegram (no browser)
+  tg_join          joining a private Telegram channel from its invite -> sites.telegram (no browser)
+Telegram jobs are asked for only when the account is set up (the `telegram` secrets), one at a time.
 Up to PARALLEL sites are read side by side while the light jobs (no browser) run beside them. Chrome starts only when a
 job needs it. With nothing left, the runner waits IDLE_MINUTES for new jobs before it ends, so a job added
 meanwhile starts at once. Logs carry kinds and counts only, never an address.
@@ -27,7 +30,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-from sites import explorer, health, title_info, torrent_files, torrent_scan, watch
+from sites import explorer, health, telegram, title_info, torrent_files, torrent_scan, watch
 
 HOOK = "miinspact-site"
 MAX_MINUTES = 330              # the run's own limit (sites.yml stops at 340)
@@ -37,6 +40,7 @@ BEAT = 60                      # seconds between heartbeats
 PARALLEL = 3                   # sites read at the same time (one tab each)
 BROWSER_KINDS = ("torrent_scan", "torrent_search", "torrent_explore", "watch_explore", "watch_crawl", "page_info")
 LIGHT_KINDS = ("life", "title_info")
+TG_KINDS = ("tg_scan", "tg_join")
 
 
 def _page_info(work: dict, fetch) -> dict:
@@ -103,6 +107,10 @@ class _Run:
                 result = _life(work)
             elif kind == "title_info":
                 result = title_info.lookup(work)
+            elif kind == "tg_scan":
+                result = telegram.client().scan(work)
+            elif kind == "tg_join":
+                result = telegram.client().join(work)
             elif kind in BROWSER_KINDS:
                 with chrome.tab() as tab:
                     if kind in ("torrent_scan", "torrent_search"):
@@ -141,7 +149,8 @@ def run(api, sessions_file: str = "", browser_cls=None, minutes: float = MAX_MIN
     threading.Thread(target=run.beat_loop, args=(stop,), daemon=True).start()
     pages = concurrent.futures.ThreadPoolExecutor(max_workers=parallel)
     lights = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    busy = {"browser": set(), "light": set()}
+    tg = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    busy = {"browser": set(), "light": set(), "tg": set()}
     done, chrome, last_work = 0, None, time.time()
     try:
         while True:
@@ -150,7 +159,8 @@ def run(api, sessions_file: str = "", browser_cls=None, minutes: float = MAX_MIN
                 done += len(finished)
                 lane -= finished
             kinds = (list(BROWSER_KINDS) if len(busy["browser"]) < parallel else []) + \
-                (list(LIGHT_KINDS) if not busy["light"] else [])
+                (list(LIGHT_KINDS) if not busy["light"] else []) + \
+                (list(TG_KINDS) if telegram.configured() and not busy["tg"] else [])
             job = None
             if kinds and time.time() < end:
                 job = run.ask("next", kinds=kinds).get("job")
@@ -168,10 +178,10 @@ def run(api, sessions_file: str = "", browser_cls=None, minutes: float = MAX_MIN
                             run.active.discard(job["id"])
                         done += 1
                         continue
-                lane = "light" if job.get("kind") in LIGHT_KINDS else "browser"
-                busy[lane].add((lights if lane == "light" else pages).submit(run.do, job, chrome))
+                lane = "light" if job.get("kind") in LIGHT_KINDS else "tg" if job.get("kind") in TG_KINDS else "browser"
+                busy[lane].add({"light": lights, "tg": tg, "browser": pages}[lane].submit(run.do, job, chrome))
                 continue
-            running = busy["browser"] | busy["light"]
+            running = busy["browser"] | busy["light"] | busy["tg"]
             if not running and (time.time() >= end or time.time() - last_work >= idle_minutes * 60):
                 break
             if running:
@@ -182,6 +192,8 @@ def run(api, sessions_file: str = "", browser_cls=None, minutes: float = MAX_MIN
     finally:
         pages.shutdown(wait=True)
         lights.shutdown(wait=True)
+        tg.shutdown(wait=True)
+        telegram.close()
         done += sum(len(lane) for lane in busy.values())
         stop.set()
         if chrome is not None:

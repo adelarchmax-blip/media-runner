@@ -12,7 +12,7 @@ import time
 import requests
 
 from poster import poster_thumb, process_poster, work_details
-from sites import hook
+from sites import hook, telegram     # telegram takes its keys out of the environment first
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 for noisy in ("urllib3", "requests", "PIL"):
@@ -831,7 +831,7 @@ def process(item: dict):
             logging.warning(f"item {item_id}: no details ({type(e).__name__})")
         progress.stage = "item_download"
         progress.push(force=True)
-        fetch = download_torrent if item.get("kind") == "torrent" else download
+        fetch = {"torrent": download_torrent, "telegram": download_telegram}.get(item.get("kind"), download)
         video, subtitles = fetch(item, os.path.join(job_dir, base_name), progress)
         progress.stage = "item_verify"
         video = verify_video(video)
@@ -859,7 +859,7 @@ def process(item: dict):
         logging.info(f"item {item_id}: uploaded ({progress.size_mb:.0f} MB)")
     except Stopped:
         logging.info(f"item {item_id}: stopped by the owner, its files are removed")
-        if item.get("kind") != "torrent":
+        if item.get("kind") in (None, "page"):
             stop_leftover_mdm()
     except Exception as e:
         if progress.stopped:      # a command cut by "stop" fails on its own: not a real failure
@@ -870,6 +870,24 @@ def process(item: dict):
     finally:
         free_disk(item_id)
         shutil.rmtree(job_dir, ignore_errors=True)
+
+
+# ---------- telegram (the account's own session, no browser) ----------
+
+def download_telegram(item: dict, out_base: str, progress: Progress) -> tuple:
+    """فيديو واحد من رسالة في قناة تليجرام، بحساب المالك اللي في خزنة جيت هب"""
+    tg = telegram.client()
+    size = tg.size(item.get("watch_url"))
+    progress.size_mb = size / 1048576
+    hold_disk(int(item["id"]), size * 2)          # the video + its checked copy
+    started = time.time()
+
+    def on_progress(done, total):
+        progress.dl_pct = int(done * 100 / total) if total else 0
+        progress.speed = done / max(1.0, time.time() - started) / 1048576
+        progress.push()
+    left = max(60.0, MAX_SECONDS - STOP_MARGIN - (time.time() - START))
+    return tg.download(item.get("watch_url"), out_base, on_progress, timeout=left), []
 
 
 def time_left() -> bool:
@@ -926,6 +944,23 @@ def torrent_lane(count: dict, busy: threading.Event):
         busy.clear()
 
 
+def telegram_lane(count: dict, others_busy: threading.Event):
+    """Telegram videos one after another (one account, so one download at a time)."""
+    try:
+        while time_left():
+            items = next_items("telegram", 1, f"g{count['telegram']}")
+            if not items:
+                if not others_busy.is_set():
+                    return
+                time.sleep(EMPTY_RECHECK)
+                continue
+            for item in items:
+                process(item)
+                count["telegram"] += 1
+    finally:
+        telegram.close()
+
+
 def restore_sessions():
     """Sign-ins come back on every new runner: Chrome (grab.mjs) and .torrent downloads use them."""
     if hook.save_sessions(api, SESSIONS_FILE):
@@ -937,19 +972,24 @@ def main():
     stop = threading.Event()
     threading.Thread(target=heartbeat_loop, args=(stop,), daemon=True).start()
     set_stage("working")
-    count = {"pages": 0, "torrents": 0}
+    count = {"pages": 0, "torrents": 0, "telegram": 0}
     busy = threading.Event()
     busy.set()
     lane = threading.Thread(target=torrent_lane, args=(count, busy), daemon=True)
     lane.start()
+    tg = threading.Thread(target=telegram_lane, args=(count, busy), daemon=True) if telegram.configured() else None
+    if tg:
+        tg.start()
     try:
         if not TORRENTS_ONLY:
             page_lane(count, busy)
         lane.join()
+        if tg:
+            tg.join()
     finally:
         stop.set()
         set_stage("done")
-    logging.info(f"processed {count['pages']} page item(s) + {count['torrents']} torrent(s) "
+    logging.info(f"processed {count['pages']} page item(s) + {count['torrents']} torrent(s) + {count['telegram']} telegram "
                  f"in {(time.time() - START) / 60:.1f} min")
 
 

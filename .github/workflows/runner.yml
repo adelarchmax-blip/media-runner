@@ -19,6 +19,9 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    # The Telegram account's keys live in this environment's secrets and reach only the Python step below,
+    # which takes them out of its environment at once (sites/telegram.py). Without them Telegram is skipped.
+    environment: telegram
     timeout-minutes: 355
     env:
       RUNNER_API_URL: ${{ secrets.RUNNER_API_URL }}
@@ -78,4 +81,7 @@ jobs:
           SEARX_URL: http://127.0.0.1:8888
           RCLONE_REMOTE: ${{ secrets.RCLONE_REMOTE }}
           MEDIA_BASE_PATH: ${{ secrets.MEDIA_BASE_PATH }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION_GET }}
         run: python worker.py
